@@ -103,6 +103,21 @@ def _format_pace_min_100m(speed_ms: float) -> str:
     return f"{minutes}:{seconds:02d}/100m"
 
 
+def _coalesce_number(mapping: dict[str, Any], *keys: str) -> float | None:
+    """Return the first numeric value for the given keys."""
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _format_summary_threshold(value: float) -> int | float:
+    """Format thresholds without truncating fractional values."""
+    rounded = round(value, 3)
+    return int(rounded) if rounded.is_integer() else rounded
+
+
 def _summarize_zone_ranges(group: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract privacy-safe zone ranges from a TrainingPeaks zone group."""
     zones = group.get("zones")
@@ -113,13 +128,15 @@ def _summarize_zone_ranges(group: dict[str, Any]) -> list[dict[str, Any]]:
     for idx, zone in enumerate(zones, start=1):
         if not isinstance(zone, dict):
             continue
-        minimum = zone.get("minimum", zone.get("min"))
-        maximum = zone.get("maximum", zone.get("max"))
-        entry: dict[str, Any] = {"label": str(zone.get("label") or idx)}
-        if isinstance(minimum, (int, float)):
-            entry["min"] = round(float(minimum), 3)
-        if isinstance(maximum, (int, float)):
-            entry["max"] = round(float(maximum), 3)
+        minimum = _coalesce_number(zone, "minimum", "min")
+        maximum = _coalesce_number(zone, "maximum", "max")
+        # Use stable generated labels instead of API labels because zone names
+        # may be user-customizable and can contain identifying text.
+        entry: dict[str, Any] = {"label": f"Z{idx}"}
+        if minimum is not None:
+            entry["min"] = round(minimum, 3)
+        if maximum is not None:
+            entry["max"] = round(maximum, 3)
         if "min" in entry or "max" in entry:
             summarized.append(entry)
     return summarized
@@ -145,11 +162,11 @@ def _summarize_settings(data: dict[str, Any]) -> dict[str, Any]:
             workout_type_id = group.get("workoutTypeId")
             sport = sport_by_id.get(workout_type_id, "other") if isinstance(workout_type_id, int) else "other"
             key = "lthr_bpm" if sport in ("general", "other") else f"lthr_bpm_{sport}"
-            summary.setdefault(key, int(threshold))
+            summary[key] = _format_summary_threshold(float(threshold))
             zones = _summarize_zone_ranges(group)
             if zones:
                 zone_key = "hr_zones" if sport in ("general", "other") else f"hr_zones_{sport}"
-                summary.setdefault(zone_key, zones)
+                summary[zone_key] = zones
 
     speed_zones = data.get("speedZones")
     if isinstance(speed_zones, list):
@@ -167,7 +184,7 @@ def _summarize_settings(data: dict[str, Any]) -> dict[str, Any]:
             else:
                 entry["pace_min_per_km"] = _format_pace_min_km(float(threshold))
             key = f"lt_pace_{sport}" if sport != "other" else "lt_pace_other"
-            summary.setdefault(key, entry)
+            summary[key] = entry
 
     power_zones = data.get("powerZones")
     if isinstance(power_zones, list):
@@ -180,11 +197,11 @@ def _summarize_settings(data: dict[str, Any]) -> dict[str, Any]:
             workout_type_id = group.get("workoutTypeId")
             sport = sport_by_id.get(workout_type_id, "other") if isinstance(workout_type_id, int) else "other"
             key = "ftp_watts" if sport in ("general", "other") else f"ftp_watts_{sport}"
-            summary.setdefault(key, int(threshold))
+            summary[key] = _format_summary_threshold(float(threshold))
             zones = _summarize_zone_ranges(group)
             if zones:
                 zone_key = "power_zones" if sport in ("general", "other") else f"power_zones_{sport}"
-                summary.setdefault(zone_key, zones)
+                summary[zone_key] = zones
 
     return summary
 

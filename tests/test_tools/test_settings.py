@@ -69,13 +69,15 @@ class TestGetAthleteSettingsSummary:
             "lt_pace_swim": {"threshold_m_per_s": 0.952, "pace_min_per_100m": "1:45/100m"},
             "ftp_watts_bike": 250,
             "power_zones_bike": [
-                {"label": "Easy", "min": 0.0, "max": 140.0},
-                {"label": "Endurance", "min": 141.0, "max": 190.0},
+                {"label": "Z1", "min": 0.0, "max": 140.0},
+                {"label": "Z2", "min": 141.0, "max": 190.0},
             ],
         }
         assert "athleteId" not in summary
         assert "email" not in summary
         assert "name" not in summary
+        assert "Easy" not in str(summary)
+        assert "Endurance" not in str(summary)
 
     @pytest.mark.asyncio
     async def test_summary_tool_returns_only_summary(self):
@@ -94,6 +96,28 @@ class TestGetAthleteSettingsSummary:
             result = await tp_get_athlete_settings_summary()
 
         assert result == {"summary": {"ftp_watts_bike": 250}}
+    def test_summary_handles_fallback_ranges_fractional_thresholds_and_later_groups(self):
+        settings = {
+            "powerZones": [
+                {
+                    "threshold": 249.4,
+                    "workoutTypeId": 2,
+                    "zones": [{"minimum": None, "min": 100, "maximum": None, "max": 200, "label": "Private Label"}],
+                },
+                {
+                    "threshold": 249.6,
+                    "workoutTypeId": 2,
+                    "zones": [{"min": 101, "max": 201, "label": "Later Private Label"}],
+                },
+            ]
+        }
+
+        summary = _summarize_settings(settings)
+
+        assert summary["ftp_watts_bike"] == 249.6
+        assert summary["power_zones_bike"] == [{"label": "Z1", "min": 101.0, "max": 201.0}]
+        assert "Private Label" not in str(summary)
+        assert "Later Private Label" not in str(summary)
 
 
 class TestUpdateFTP:
