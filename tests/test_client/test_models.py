@@ -4,7 +4,6 @@ from datetime import date
 
 from tp_mcp.client.models import (
     PeakData,
-    UserProfile,
     WorkoutDetail,
     WorkoutSummary,
     parse_user_profile,

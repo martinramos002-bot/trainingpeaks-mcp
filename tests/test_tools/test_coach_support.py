@@ -1,12 +1,11 @@
 """Tests for coach account support: context var, ensure_athlete_id, schema injection."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from tp_mcp.client.context import athlete_override
 from tp_mcp.client.http import TPClient
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -103,6 +102,7 @@ def _mock_client(user_data):
 # Context variable lifecycle
 # ---------------------------------------------------------------------------
 
+
 class TestAthleteOverrideContextVar:
     def test_default_is_none(self):
         assert athlete_override.get() is None
@@ -126,6 +126,7 @@ class TestAthleteOverrideContextVar:
 # ---------------------------------------------------------------------------
 # ensure_athlete_id — no override (coach's own)
 # ---------------------------------------------------------------------------
+
 
 class TestEnsureAthleteIdNoOverride:
     @pytest.mark.asyncio
@@ -167,6 +168,7 @@ class TestEnsureAthleteIdNoOverride:
 # ---------------------------------------------------------------------------
 # ensure_athlete_id — with name override
 # ---------------------------------------------------------------------------
+
 
 class TestEnsureAthleteIdNameOverride:
     @pytest.mark.asyncio
@@ -264,6 +266,7 @@ class TestEnsureAthleteIdNameOverride:
 # ensure_athlete_id — with ID override
 # ---------------------------------------------------------------------------
 
+
 class TestEnsureAthleteIdIdOverride:
     @pytest.mark.asyncio
     async def test_resolve_by_id(self):
@@ -290,6 +293,7 @@ class TestEnsureAthleteIdIdOverride:
 # ensure_athlete_id — cache bypass when override is set
 # ---------------------------------------------------------------------------
 
+
 class TestCacheBypass:
     @pytest.mark.asyncio
     async def test_bypasses_cache_with_override(self):
@@ -310,17 +314,18 @@ class TestCacheBypass:
 # Schema injection
 # ---------------------------------------------------------------------------
 
+
 class TestSchemaInjection:
     def test_non_exempt_tools_have_athlete_param(self):
-        from tp_mcp.server import TOOLS, _ATHLETE_EXEMPT_TOOLS
+        from tp_mcp.server import _ATHLETE_EXEMPT_TOOLS, TOOLS
+
         for tool in TOOLS:
             if tool.name not in _ATHLETE_EXEMPT_TOOLS:
-                assert "athlete" in tool.inputSchema["properties"], (
-                    f"Tool {tool.name} missing 'athlete' property"
-                )
+                assert "athlete" in tool.inputSchema["properties"], f"Tool {tool.name} missing 'athlete' property"
 
     def test_exempt_tools_lack_athlete_param(self):
-        from tp_mcp.server import TOOLS, _ATHLETE_EXEMPT_TOOLS
+        from tp_mcp.server import _ATHLETE_EXEMPT_TOOLS, TOOLS
+
         for tool in TOOLS:
             if tool.name in _ATHLETE_EXEMPT_TOOLS:
                 assert "athlete" not in tool.inputSchema["properties"], (
@@ -329,6 +334,7 @@ class TestSchemaInjection:
 
     def test_tp_list_athletes_in_tools(self):
         from tp_mcp.server import TOOLS
+
         names = [t.name for t in TOOLS]
         assert "tp_list_athletes" in names
 
@@ -336,6 +342,7 @@ class TestSchemaInjection:
 # ---------------------------------------------------------------------------
 # call_tool strips athlete and sets context var
 # ---------------------------------------------------------------------------
+
 
 class TestCallToolAthleteStripping:
     @pytest.mark.asyncio
@@ -346,6 +353,7 @@ class TestCallToolAthleteStripping:
         from tp_mcp.server import _TOOL_HANDLERS
 
         original = _TOOL_HANDLERS.get("tp_auth_status")
+
         async def spy(args):
             captured_args.update(args)
             return {"status": "ok"}
@@ -353,6 +361,7 @@ class TestCallToolAthleteStripping:
         _TOOL_HANDLERS["tp_auth_status"] = spy
         try:
             from tp_mcp.server import call_tool
+
             await call_tool("tp_auth_status", {"athlete": "Charlotte Horton", "extra": "val"})
             assert "athlete" not in captured_args
             assert captured_args.get("extra") == "val"
@@ -366,12 +375,14 @@ class TestCallToolAthleteStripping:
         from tp_mcp.server import _TOOL_HANDLERS
 
         original = _TOOL_HANDLERS.get("tp_list_athletes")
+
         async def stub(args):
             return {"athletes": []}
 
         _TOOL_HANDLERS["tp_list_athletes"] = stub
         try:
             from tp_mcp.server import call_tool
+
             await call_tool("tp_list_athletes", {"athlete": "test"})
             assert athlete_override.get() is None
         finally:
@@ -384,14 +395,16 @@ class TestCallToolAthleteStripping:
         from tp_mcp.server import _TOOL_HANDLERS
 
         original = _TOOL_HANDLERS.get("tp_list_athletes")
+
         async def exploding(args):
             raise RuntimeError("boom")
 
         _TOOL_HANDLERS["tp_list_athletes"] = exploding
         try:
             from tp_mcp.server import call_tool
+
             # Should not raise (call_tool catches exceptions)
-            result = await call_tool("tp_list_athletes", {"athlete": "test"})
+            await call_tool("tp_list_athletes", {"athlete": "test"})
             assert athlete_override.get() is None
         finally:
             if original:

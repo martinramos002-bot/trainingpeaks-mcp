@@ -17,8 +17,37 @@ from tp_mcp.tools.settings import (
 
 class TestGetAthleteSettings:
     @pytest.mark.asyncio
-    async def test_success(self):
-        response = APIResponse(success=True, data={"threshold": 280, "zones": []})
+    async def test_success_includes_read_only_summary(self):
+        """Settings audit should expose friendly threshold fields without writing."""
+        settings = {
+            "heartRateZones": [
+                {
+                    "workoutTypeId": 2,
+                    "threshold": 165,
+                    "zones": [
+                        {"label": "Z1", "minimum": 0, "maximum": 130},
+                        {"label": "Z2", "minimum": 131, "maximum": 145},
+                    ],
+                },
+                {"workoutTypeId": 3, "threshold": 172, "zones": []},
+            ],
+            "speedZones": [
+                {"workoutTypeId": 3, "threshold": 3.704, "zones": []},
+                {"workoutTypeId": 1, "threshold": 0.952, "zones": []},
+            ],
+            "powerZones": [
+                {
+                    "workoutTypeId": 2,
+                    "threshold": 280,
+                    "zones": [
+                        {"label": "Recovery", "minimum": 0, "maximum": 154},
+                        {"label": "Endurance", "minimum": 155, "maximum": 210},
+                    ],
+                },
+                {"workoutTypeId": 3, "threshold": 300, "zones": []},
+            ],
+        }
+        response = APIResponse(success=True, data=settings)
         with patch("tp_mcp.tools.settings.TPClient") as mock_client:
             mock_instance = AsyncMock()
             mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
@@ -26,7 +55,70 @@ class TestGetAthleteSettings:
             mock_client.return_value.__aenter__.return_value = mock_instance
 
             result = await tp_get_athlete_settings()
-        assert "settings" in result
+
+        assert result["settings"] == settings
+        assert result["summary"] == {
+            "ftp_watts_bike": 280,
+            "ftp_watts_run": 300,
+            "lthr_bpm_bike": 165,
+            "lthr_bpm_run": 172,
+            "lt_pace_run": {"threshold_m_per_s": 3.704, "pace_min_per_km": "4:30/km"},
+            "lt_pace_swim": {"threshold_m_per_s": 0.952, "pace_min_per_100m": "1:45/100m"},
+            "hr_zones_bike": [
+                {"label": "Z1", "min": 0.0, "max": 130.0},
+                {"label": "Z2", "min": 131.0, "max": 145.0},
+            ],
+            "power_zones_bike": [
+                {"label": "Recovery", "min": 0.0, "max": 154.0},
+                {"label": "Endurance", "min": 155.0, "max": 210.0},
+            ],
+        }
+        mock_instance.get.assert_awaited_once_with("/fitness/v1/athletes/123/settings")
+        mock_instance.put.assert_not_called()
+        mock_instance.post.assert_not_called()
+
+    def test_summarize_settings_ignores_private_identity_fields(self):
+        """The summary should not surface names, emails, or athlete IDs."""
+        from tp_mcp.tools.settings import _summarize_settings
+
+        summary = _summarize_settings(
+            {
+                "athleteId": 123456,
+                "email": "athlete@example.com",
+                "name": "Private Athlete",
+                "powerZones": [{"workoutTypeId": 2, "threshold": 250}],
+            }
+        )
+
+        assert summary == {"ftp_watts_bike": 250}
+        assert "athleteId" not in summary
+        assert "email" not in summary
+        assert "name" not in summary
+
+    @pytest.mark.asyncio
+    async def test_get_settings_returns_raw_payload_plus_summary(self):
+        """Existing settings tool should carry the compact summary without a sibling tool."""
+        from tp_mcp.tools.settings import tp_get_athlete_settings
+
+        settings = {
+            "athleteId": 123456,
+            "email": "athlete@example.com",
+            "name": "Private Athlete",
+            "powerZones": [{"workoutTypeId": 2, "threshold": 250}],
+        }
+        with patch("tp_mcp.tools.settings.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=APIResponse(success=True, data=settings))
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_athlete_settings()
+
+        assert result["summary"] == {"ftp_watts_bike": 250}
+        assert result["settings"] == settings
+        mock_instance.get.assert_awaited_once_with("/fitness/v1/athletes/123/settings")
+        mock_instance.put.assert_not_called()
+        mock_instance.post.assert_not_called()
 
 
 class TestUpdateFTP:

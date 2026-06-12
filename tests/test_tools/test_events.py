@@ -378,6 +378,65 @@ class TestGetNoteComments:
         assert result["error_code"] == "VALIDATION_ERROR"
 
 
+class TestListNotesCompatibility:
+    @pytest.mark.asyncio
+    async def test_tp_list_notes_uses_upstream_name_and_legacy_shape(self):
+        data = [
+            {
+                "id": 83073469,
+                "title": "Disponibilidad",
+                "description": "Lunes no disponible",
+                "noteDate": "2026-05-17T00:00:00",
+                "commentCount": 0,
+                "isHidden": False,
+                "ownerId": 1463609,
+                "attachments": [],
+            }
+        ]
+        response = APIResponse(success=True, data=data)
+        with patch("tp_mcp.tools.events.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=1463609)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_list_notes(start_date="2026-05-17", end_date="2026-05-18")
+
+        assert result["count"] == 1
+        assert result["notes"][0]["id"] == 83073469
+        assert result["notes"][0]["date"] == "2026-05-17"
+        assert result["date_range"] == {"start": "2026-05-17", "end": "2026-05-18"}
+        mock_instance.get.assert_awaited_once_with(
+            "/fitness/v2/athletes/1463609/calendarNote/2026-05-17/2026-05-18"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tp_list_notes_normalizes_date_range_like_upstream(self):
+        response = APIResponse(success=True, data=[])
+        with patch("tp_mcp.tools.events.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=1463609)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_list_notes(start_date="2026-05-01", end_date="2026-05-31")
+
+        assert result["date_range"] == {"start": "2026-05-01", "end": "2026-05-31"}
+
+    @pytest.mark.asyncio
+    async def test_tp_list_notes_missing_note_date_is_none(self):
+        response = APIResponse(success=True, data=[{"id": 1, "title": "No date"}])
+        with patch("tp_mcp.tools.events.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=1463609)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_list_notes(start_date="2026-05-01", end_date="2026-05-31")
+
+        assert result["notes"][0]["date"] is None
+
+
 class TestAddNoteComment:
     @pytest.mark.asyncio
     async def test_add_comment_success(self):

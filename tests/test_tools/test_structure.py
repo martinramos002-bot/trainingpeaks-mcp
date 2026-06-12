@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tp_mcp.tools.structure import (
     SimpleRepetitionBlock,
@@ -20,8 +21,11 @@ class TestBuildSimpleStep:
 
     def test_warmup_step(self):
         step = SimpleStep(
-            name="Warm Up", duration_seconds=600,
-            intensity_min=40, intensity_max=55, intensityClass="warmUp",
+            name="Warm Up",
+            duration_seconds=600,
+            intensity_min=40,
+            intensity_max=55,
+            intensityClass="warmUp",
         )
         structure = SimpleWorkoutStructure(steps=[step])
         wire = build_wire_structure(structure)
@@ -37,8 +41,11 @@ class TestBuildSimpleStep:
 
     def test_active_step(self):
         step = SimpleStep(
-            name="Threshold", duration_seconds=1200,
-            intensity_min=95, intensity_max=105, intensityClass="active",
+            name="Threshold",
+            duration_seconds=1200,
+            intensity_min=95,
+            intensity_max=105,
+            intensityClass="active",
         )
         structure = SimpleWorkoutStructure(steps=[step])
         wire = build_wire_structure(structure)
@@ -47,8 +54,11 @@ class TestBuildSimpleStep:
 
     def test_cooldown_step(self):
         step = SimpleStep(
-            name="Cool Down", duration_seconds=300,
-            intensity_min=30, intensity_max=45, intensityClass="coolDown",
+            name="Cool Down",
+            duration_seconds=300,
+            intensity_min=30,
+            intensity_max=45,
+            intensityClass="coolDown",
         )
         structure = SimpleWorkoutStructure(steps=[step])
         wire = build_wire_structure(structure)
@@ -57,9 +67,13 @@ class TestBuildSimpleStep:
 
     def test_step_with_cadence(self):
         step = SimpleStep(
-            name="High Cadence", duration_seconds=300,
-            intensity_min=70, intensity_max=80, intensityClass="active",
-            cadence_min=95, cadence_max=105,
+            name="High Cadence",
+            duration_seconds=300,
+            intensity_min=70,
+            intensity_max=80,
+            intensityClass="active",
+            cadence_min=95,
+            cadence_max=105,
         )
         structure = SimpleWorkoutStructure(steps=[step])
         wire = build_wire_structure(structure)
@@ -108,14 +122,39 @@ class TestMultiBlockStructure:
     """Test multi-block structure with cumulative begin/end times."""
 
     def test_three_block_structure(self):
-        warmup = SimpleStep(name="WU", duration_seconds=600, intensity_min=40, intensity_max=55, intensityClass="warmUp")
+        warmup = SimpleStep(
+            name="WU",
+            duration_seconds=600,
+            intensity_min=40,
+            intensity_max=55,
+            intensityClass="warmUp",
+        )
         intervals = SimpleRepetitionBlock(
-            reps=4, steps=[
-                SimpleStep(name="Hard", duration_seconds=300, intensity_min=90, intensity_max=100, intensityClass="active"),
-                SimpleStep(name="Easy", duration_seconds=120, intensity_min=50, intensity_max=60, intensityClass="rest"),
+            reps=4,
+            steps=[
+                SimpleStep(
+                    name="Hard",
+                    duration_seconds=300,
+                    intensity_min=90,
+                    intensity_max=100,
+                    intensityClass="active",
+                ),
+                SimpleStep(
+                    name="Easy",
+                    duration_seconds=120,
+                    intensity_min=50,
+                    intensity_max=60,
+                    intensityClass="rest",
+                ),
             ],
         )
-        cooldown = SimpleStep(name="CD", duration_seconds=600, intensity_min=40, intensity_max=55, intensityClass="coolDown")
+        cooldown = SimpleStep(
+            name="CD",
+            duration_seconds=600,
+            intensity_min=40,
+            intensity_max=55,
+            intensityClass="coolDown",
+        )
 
         structure = SimpleWorkoutStructure(steps=[warmup, intervals, cooldown])
         wire = build_wire_structure(structure)
@@ -141,8 +180,11 @@ class TestComputeIFTSS:
     def test_steady_state_workout(self):
         """60 min at 75% FTP -> IF ~0.75, TSS ~56."""
         step = SimpleStep(
-            name="Endurance", duration_seconds=3600,
-            intensity_min=75, intensity_max=75, intensityClass="active",
+            name="Endurance",
+            duration_seconds=3600,
+            intensity_min=75,
+            intensity_max=75,
+            intensityClass="active",
         )
         structure = SimpleWorkoutStructure(steps=[step])
         intensity_factor, tss, total = compute_if_tss(structure)
@@ -153,14 +195,39 @@ class TestComputeIFTSS:
 
     def test_structured_workout(self):
         """Mixed intensity workout should compute correctly."""
-        warmup = SimpleStep(name="WU", duration_seconds=600, intensity_min=50, intensity_max=60, intensityClass="warmUp")
+        warmup = SimpleStep(
+            name="WU",
+            duration_seconds=600,
+            intensity_min=50,
+            intensity_max=60,
+            intensityClass="warmUp",
+        )
         intervals = SimpleRepetitionBlock(
-            reps=4, steps=[
-                SimpleStep(name="Hard", duration_seconds=300, intensity_min=95, intensity_max=105, intensityClass="active"),
-                SimpleStep(name="Easy", duration_seconds=120, intensity_min=50, intensity_max=60, intensityClass="rest"),
+            reps=4,
+            steps=[
+                SimpleStep(
+                    name="Hard",
+                    duration_seconds=300,
+                    intensity_min=95,
+                    intensity_max=105,
+                    intensityClass="active",
+                ),
+                SimpleStep(
+                    name="Easy",
+                    duration_seconds=120,
+                    intensity_min=50,
+                    intensity_max=60,
+                    intensityClass="rest",
+                ),
             ],
         )
-        cooldown = SimpleStep(name="CD", duration_seconds=600, intensity_min=40, intensity_max=50, intensityClass="coolDown")
+        cooldown = SimpleStep(
+            name="CD",
+            duration_seconds=600,
+            intensity_min=40,
+            intensity_max=50,
+            intensityClass="coolDown",
+        )
 
         structure = SimpleWorkoutStructure(steps=[warmup, intervals, cooldown])
         intensity_factor, tss, total = compute_if_tss(structure)
@@ -174,7 +241,13 @@ class TestComputeIFTSS:
         # Cannot create empty structure due to min_length=1, so test directly
         from tp_mcp.tools.structure import SimpleWorkoutStructure
 
-        step = SimpleStep(name="x", duration_seconds=1, intensity_min=0, intensity_max=0, intensityClass="active")
+        step = SimpleStep(
+            name="x",
+            duration_seconds=1,
+            intensity_min=0,
+            intensity_max=0,
+            intensityClass="active",
+        )
         structure = SimpleWorkoutStructure(steps=[step])
         _, _, total = compute_if_tss(structure)
         assert total == 1
@@ -184,24 +257,48 @@ class TestValidation:
     """Test structure validation."""
 
     def test_missing_duration_raises(self):
-        with pytest.raises(Exception):
-            SimpleStep(name="Bad", duration_seconds=0, intensity_min=50, intensity_max=60, intensityClass="active")
+        with pytest.raises(ValidationError):
+            SimpleStep(
+                name="Bad",
+                duration_seconds=0,
+                intensity_min=50,
+                intensity_max=60,
+                intensityClass="active",
+            )
 
     def test_empty_steps_raises(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SimpleWorkoutStructure(steps=[])
 
     def test_invalid_intensity_class(self):
-        with pytest.raises(Exception):
-            SimpleStep(name="Bad", duration_seconds=300, intensity_min=50, intensity_max=60, intensityClass="invalid")
+        with pytest.raises(ValidationError):
+            SimpleStep(
+                name="Bad",
+                duration_seconds=300,
+                intensity_min=50,
+                intensity_max=60,
+                intensityClass="invalid",
+            )
 
     def test_intensity_min_gt_max(self):
-        with pytest.raises(Exception):
-            SimpleStep(name="Bad", duration_seconds=300, intensity_min=100, intensity_max=50, intensityClass="active")
+        with pytest.raises(ValidationError):
+            SimpleStep(
+                name="Bad",
+                duration_seconds=300,
+                intensity_min=100,
+                intensity_max=50,
+                intensityClass="active",
+            )
 
     def test_invalid_primary_metric(self):
-        step = SimpleStep(name="OK", duration_seconds=300, intensity_min=50, intensity_max=60, intensityClass="active")
-        with pytest.raises(Exception):
+        step = SimpleStep(
+            name="OK",
+            duration_seconds=300,
+            intensity_min=50,
+            intensity_max=60,
+            intensityClass="active",
+        )
+        with pytest.raises(ValidationError):
             SimpleWorkoutStructure(primaryIntensityMetric="invalidMetric", steps=[step])
 
 
@@ -212,7 +309,13 @@ class TestParseStructureInput:
         data = {
             "primaryIntensityMetric": "percentOfFtp",
             "steps": [
-                {"name": "WU", "duration_seconds": 600, "intensity_min": 40, "intensity_max": 55, "intensityClass": "warmUp"},
+                {
+                    "name": "WU",
+                    "duration_seconds": 600,
+                    "intensity_min": 40,
+                    "intensity_max": 55,
+                    "intensityClass": "warmUp",
+                },
             ],
         }
         parsed = parse_structure_input(data)
@@ -222,7 +325,13 @@ class TestParseStructureInput:
     def test_parse_from_json_string(self):
         data = {
             "steps": [
-                {"name": "Main", "duration_seconds": 1200, "intensity_min": 80, "intensity_max": 90, "intensityClass": "active"},
+                {
+                    "name": "Main",
+                    "duration_seconds": 1200,
+                    "intensity_min": 80,
+                    "intensity_max": 90,
+                    "intensityClass": "active",
+                },
             ],
         }
         parsed = parse_structure_input(json.dumps(data))
@@ -232,10 +341,23 @@ class TestParseStructureInput:
         data = {
             "steps": [
                 {
-                    "type": "repetition", "reps": 3,
+                    "type": "repetition",
+                    "reps": 3,
                     "steps": [
-                        {"name": "ON", "duration_seconds": 60, "intensity_min": 95, "intensity_max": 105, "intensityClass": "active"},
-                        {"name": "OFF", "duration_seconds": 60, "intensity_min": 50, "intensity_max": 60, "intensityClass": "rest"},
+                        {
+                            "name": "ON",
+                            "duration_seconds": 60,
+                            "intensity_min": 95,
+                            "intensity_max": 105,
+                            "intensityClass": "active",
+                        },
+                        {
+                            "name": "OFF",
+                            "duration_seconds": 60,
+                            "intensity_min": 50,
+                            "intensity_max": 60,
+                            "intensityClass": "rest",
+                        },
                     ],
                 },
             ],
@@ -254,14 +376,34 @@ class TestTpValidateStructure:
 
     @pytest.mark.asyncio
     async def test_valid_structure_returns_summary(self):
-        data = json.dumps({
-            "primaryIntensityMetric": "percentOfFtp",
-            "steps": [
-                {"name": "WU", "duration_seconds": 600, "intensity_min": 40, "intensity_max": 55, "intensityClass": "warmUp"},
-                {"name": "Main", "duration_seconds": 1200, "intensity_min": 85, "intensity_max": 95, "intensityClass": "active"},
-                {"name": "CD", "duration_seconds": 600, "intensity_min": 40, "intensity_max": 55, "intensityClass": "coolDown"},
-            ],
-        })
+        data = json.dumps(
+            {
+                "primaryIntensityMetric": "percentOfFtp",
+                "steps": [
+                    {
+                        "name": "WU",
+                        "duration_seconds": 600,
+                        "intensity_min": 40,
+                        "intensity_max": 55,
+                        "intensityClass": "warmUp",
+                    },
+                    {
+                        "name": "Main",
+                        "duration_seconds": 1200,
+                        "intensity_min": 85,
+                        "intensity_max": 95,
+                        "intensityClass": "active",
+                    },
+                    {
+                        "name": "CD",
+                        "duration_seconds": 600,
+                        "intensity_min": 40,
+                        "intensity_max": 55,
+                        "intensityClass": "coolDown",
+                    },
+                ],
+            }
+        )
         result = await tp_validate_structure(data)
 
         assert result["valid"] is True

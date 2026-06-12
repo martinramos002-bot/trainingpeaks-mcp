@@ -12,7 +12,6 @@ from tp_mcp.tools.equipment import (
     tp_update_equipment,
 )
 
-
 MOCK_EQUIPMENT = [
     {"equipmentId": 1, "name": "Tarmac SL7", "equipmentType": 1, "brand": "Specialized",
      "model": "SL7", "distance": 5000000, "startingDistance": 0, "maxDistance": 0,

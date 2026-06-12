@@ -409,8 +409,10 @@ async def tp_create_workout(
         structured_workout: Optional native TP structured workout payload.
         subtype_id: Optional workout subtype ID (e.g. Road Bike=3).
         tags: Optional comma-separated tags string.
-        feeling: Optional TrainingPeaks feeling value (0-10).
-        rpe: Optional RPE score (0-10).
+        feeling: Optional TrainingPeaks/Garmin feeling internal code (0-10 range):
+            inverse scale when provided by Garmin, 1=Muy fuerte, 3=Fuerte,
+            5=Normal, 7=Débil, 9=Muy débil; higher is worse.
+        rpe: Optional RPE score (0-10; 0=sin esfuerzo, 10=max).
 
     Returns:
         Dict with created workout details or error.

@@ -109,8 +109,10 @@ class TestCreateLibraryItem:
             mock_client.return_value.__aenter__.return_value = mock_instance
 
             result = await tp_create_library_item(
-                library_id="1", name="Tempo",
-                sport_family_id=2, sport_type_id=3,
+                library_id="1",
+                name="Tempo",
+                sport_family_id=2,
+                sport_type_id=3,
                 structure=structure,
             )
 

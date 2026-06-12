@@ -3,6 +3,14 @@
 from tp_mcp.tools.analyze import tp_analyze_workout
 from tp_mcp.tools.atp import tp_get_atp
 from tp_mcp.tools.auth_status import tp_auth_status
+from tp_mcp.tools.coach_composites import (
+    tp_coach_daily_brief_context,
+    tp_coach_period_review_context,
+    tp_coach_plan_guardrails,
+    tp_coach_readiness_snapshot,
+    tp_coach_week_context,
+    tp_coach_workout_compliance_v2,
+)
 from tp_mcp.tools.equipment import (
     tp_create_equipment,
     tp_delete_equipment,
@@ -50,6 +58,7 @@ from tp_mcp.tools.settings import (
     tp_update_nutrition,
     tp_update_speed_zones,
 )
+from tp_mcp.tools.strength_references import tp_search_strength_exercises
 from tp_mcp.tools.structure import tp_validate_structure
 from tp_mcp.tools.weekly_summary import tp_get_weekly_summary
 from tp_mcp.tools.workout_files import (
@@ -79,6 +88,12 @@ __all__ = [
     "tp_add_workout_comment",
     "tp_analyze_workout",
     "tp_auth_status",
+    "tp_coach_daily_brief_context",
+    "tp_coach_period_review_context",
+    "tp_coach_plan_guardrails",
+    "tp_coach_readiness_snapshot",
+    "tp_coach_week_context",
+    "tp_coach_workout_compliance_v2",
     "tp_copy_workout",
     "tp_create_availability",
     "tp_create_equipment",
@@ -127,6 +142,7 @@ __all__ = [
     "tp_refresh_auth",
     "tp_reorder_workouts",
     "tp_schedule_library_workout",
+    "tp_search_strength_exercises",
     "tp_set_workout_note",
     "tp_unpair_workout",
     "tp_update_equipment",

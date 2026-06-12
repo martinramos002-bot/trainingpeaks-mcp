@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tp_mcp.client.http import APIResponse, ErrorCode
+from tp_mcp.client.http import APIResponse
 from tp_mcp.tools.fitness import tp_get_fitness
 
 

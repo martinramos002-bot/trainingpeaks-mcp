@@ -22,17 +22,15 @@ class TestTpAuthStatus:
             email="test@example.com",
         )
 
-        with patch("tp_mcp.tools.auth_status.get_credential", return_value=mock_cred):
-            with patch(
-                "tp_mcp.tools.auth_status.validate_auth",
-                new_callable=AsyncMock,
-                return_value=mock_result,
-            ):
-                with patch(
-                    "tp_mcp.tools.auth_status.get_storage_backend",
-                    return_value="keyring",
-                ):
-                    result = await tp_auth_status()
+        with patch("tp_mcp.tools.auth_status.get_credential", return_value=mock_cred), patch(
+            "tp_mcp.tools.auth_status.validate_auth",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ), patch(
+            "tp_mcp.tools.auth_status.get_storage_backend",
+            return_value="keyring",
+        ):
+            result = await tp_auth_status()
 
         assert result["valid"] is True
         assert result["athlete_id"] == 123
@@ -60,13 +58,12 @@ class TestTpAuthStatus:
             message="Session expired",
         )
 
-        with patch("tp_mcp.tools.auth_status.get_credential", return_value=mock_cred):
-            with patch(
-                "tp_mcp.tools.auth_status.validate_auth",
-                new_callable=AsyncMock,
-                return_value=mock_result,
-            ):
-                result = await tp_auth_status()
+        with patch("tp_mcp.tools.auth_status.get_credential", return_value=mock_cred), patch(
+            "tp_mcp.tools.auth_status.validate_auth",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ):
+            result = await tp_auth_status()
 
         assert result["valid"] is False
         assert "expired" in result["action_needed"].lower()

@@ -103,9 +103,32 @@ class TestListTools:
             "tp_unpair_workout",
             "tp_set_workout_note",
             "tp_get_workout_note",
+            "tp_search_strength_exercises",
         }
         assert v2_tools.issubset(names)
-        assert len(names) == len(core_tools) + len(v2_tools)
+        coach_composite_tools = {
+            "tp_coach_daily_brief_context",
+            "tp_coach_period_review_context",
+            "tp_coach_week_context",
+            "tp_coach_readiness_snapshot",
+            "tp_coach_workout_compliance_v2",
+            "tp_coach_plan_guardrails",
+        }
+        assert coach_composite_tools.issubset(names)
+        assert len(names) == len(core_tools) + len(v2_tools) + len(coach_composite_tools)
+
+    @pytest.mark.asyncio
+    async def test_strength_reference_tool_is_read_only_only(self):
+        """Only exercise reference search is exposed; no strength workout writes."""
+        tools = await list_tools()
+        names = {t.name for t in tools}
+
+        assert "tp_search_strength_exercises" in names
+        assert "tp_create_strength_workout" not in names
+        assert "tp_update_strength_workout" not in names
+        assert "tp_delete_strength_workout" not in names
+        assert "tp_get_strength_workout" not in names
+        assert "tp_list_strength_workouts" not in names
 
     @pytest.mark.asyncio
     async def test_create_workout_schema_includes_new_fields(self):
@@ -147,8 +170,13 @@ class TestListTools:
 
         for tool in (create_tool, update_tool):
             props = tool.inputSchema["properties"]
-            assert props["feeling"]["description"] == "TrainingPeaks feeling value (0-10)."
-            assert props["rpe"]["description"] == "Rating of perceived exertion (RPE), 0-10."
+            feeling_description = props["feeling"]["description"]
+            rpe_description = props["rpe"]["description"]
+            assert "0-10" in feeling_description
+            assert "inverse scale" in feeling_description
+            assert "higher is worse" in feeling_description
+            assert "RPE" in rpe_description
+            assert "0-10" in rpe_description
 
 
 # ---------------------------------------------------------------------------

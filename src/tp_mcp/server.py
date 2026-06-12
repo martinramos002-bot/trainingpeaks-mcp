@@ -20,6 +20,12 @@ from tp_mcp.tools import (
     tp_add_workout_comment,
     tp_analyze_workout,
     tp_auth_status,
+    tp_coach_daily_brief_context,
+    tp_coach_period_review_context,
+    tp_coach_plan_guardrails,
+    tp_coach_readiness_snapshot,
+    tp_coach_week_context,
+    tp_coach_workout_compliance_v2,
     tp_copy_workout,
     tp_create_availability,
     tp_create_equipment,
@@ -68,6 +74,7 @@ from tp_mcp.tools import (
     tp_refresh_auth,
     tp_reorder_workouts,
     tp_schedule_library_workout,
+    tp_search_strength_exercises,
     tp_set_workout_note,
     tp_unpair_workout,
     tp_update_equipment,
@@ -129,8 +136,11 @@ RAW_STRUCTURE_DESCRIPTION = (
     "structure, polyline, primaryLengthMetric, primaryIntensityMetric, and "
     "primaryIntensityTargetOrRange."
 )
-WORKOUT_FEELING_DESCRIPTION = "TrainingPeaks feeling value (0-10)."
-WORKOUT_RPE_DESCRIPTION = "Rating of perceived exertion (RPE), 0-10."
+WORKOUT_FEELING_DESCRIPTION = (
+    "TrainingPeaks/Garmin feeling internal code (0-10 range), inverse scale when provided by Garmin: "
+    "1=Muy fuerte, 3=Fuerte, 5=Normal, 7=Débil, 9=Muy débil; higher is worse."
+)
+WORKOUT_RPE_DESCRIPTION = "Rating of perceived exertion (RPE), 0-10 (0=sin esfuerzo, 10=max)."
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +526,106 @@ TOOLS = [
         },
     ),
     Tool(
+        name="tp_coach_daily_brief_context",
+        description=(
+            "Composite read-only Fitnessbot morning brief preflight. It fetches today's workout, readiness, "
+            "week context, and when yesterday has any planned-but-not-completed workout it MUST open "
+            "tp_get_workout plus private note and calendar notes before classifying the missed reason. "
+            "Use this before every daily/morning recommendation; never writes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Target brief date YYYY-MM-DD. Defaults to today."},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="tp_coach_period_review_context",
+        description=(
+            "Composite read-only Fitnessbot period review context for weekly, monthly, and block analyses. "
+            "Fetches workouts/load/metrics/settings/notes/availability and expands missed, key, and "
+            "plan-vs-actual anomalous workouts with tp_get_workout plus private notes before causal claims. "
+            "Use before weekly/monthly reviews and plan adjustments; never writes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "Period start YYYY-MM-DD."},
+                "end_date": {"type": "string", "description": "Period end YYYY-MM-DD."},
+                "review_type": {
+                    "type": "string",
+                    "default": "period",
+                    "description": "weekly, monthly, block, or period.",
+                },
+            },
+            "required": ["start_date", "end_date"],
+        },
+    ),
+    Tool(
+        name="tp_coach_week_context",
+        description=(
+            "Composite read-only Fitnessbot weekly/daily context: weekly summary, workouts, "
+            "CTL/ATL/TSB, athlete settings, health metrics, notes, and availability. "
+            "Use before weekly reports and before morning briefs to inspect yesterday, week-to-date progress, "
+            "and remaining-week key sessions; never writes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "week_of": {"type": "string", "description": "Date in target week (YYYY-MM-DD). Defaults to current."},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="tp_coach_readiness_snapshot",
+        description=(
+            "Composite read-only daily readiness snapshot from TP health metrics and fitness trend. "
+            "Use for informe matutino/day execution decisions; never writes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Target date YYYY-MM-DD. Defaults to today."},
+                "baseline_days": {"type": "integer", "default": 28, "description": "Metric baseline window."},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="tp_coach_workout_compliance_v2",
+        description=(
+            "Composite read-only post-workout context: workout detail, analysis, and RPE/Feeling/comment flags. "
+            "Use to close the loop and decide next 2-4 day impact; never writes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"workout_id": {"type": "string", "description": "Workout ID"}},
+            "required": ["workout_id"],
+        },
+    ),
+    Tool(
+        name="tp_coach_plan_guardrails",
+        description=(
+            "Validate a neutral weekly plan against Fitnessbot guardrails before any TP write: "
+            "single priority, unavailable days, strength/mobility presence, run intensity density, and TSS density. "
+            "Passing validation is not write approval."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "plan": {"type": "object", "description": "Neutral weekly plan draft with priority and days/workouts."},
+                "availability_by_date": {
+                    "type": "object",
+                    "description": "Map YYYY-MM-DD to availability info, e.g. {available:false}.",
+                },
+            },
+            "required": ["plan"],
+        },
+    ),
+    Tool(
         name="tp_get_atp",
         description="Get Annual Training Plan - weekly TSS targets, training periods, races. Max 90 days.",
         inputSchema={
@@ -530,7 +640,10 @@ TOOLS = [
     # --- Athlete Settings ---
     Tool(
         name="tp_get_athlete_settings",
-        description="Get athlete settings: FTP, thresholds, zones, profile.",
+        description=(
+            "Get athlete settings: FTP, thresholds, zones, profile. Includes raw settings payload "
+            "plus a compact summary for Fitnessbot-facing reports."
+        ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
@@ -581,6 +694,23 @@ TOOLS = [
         name="tp_get_pool_length_settings",
         description="Get pool length settings.",
         inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
+    Tool(
+        name="tp_search_strength_exercises",
+        description=(
+            "Read-only search of TrainingPeaks strength exercise library for reference videos, "
+            "instructions, and muscle groups. If no TP exercise matches, returns a YouTube "
+            "search URL fallback without calling YouTube. Does not read, create, update, or "
+            "delete strength workouts."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Exercise name, e.g. 'back squat'"},
+                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 25},
+            },
+            "required": ["query"],
+        },
     ),
     # --- Health Metrics ---
     Tool(
@@ -1173,6 +1303,38 @@ async def _h_get_fitness(args):
 @_handler("tp_get_weekly_summary")
 async def _h_weekly_summary(args): return await tp_get_weekly_summary(week_of=args.get("week_of"))
 
+@_handler("tp_coach_daily_brief_context")
+async def _h_coach_daily_brief_context(args):
+    return await tp_coach_daily_brief_context(date_str=args.get("date"))
+
+@_handler("tp_coach_period_review_context")
+async def _h_coach_period_review_context(args):
+    return await tp_coach_period_review_context(
+        start_date=args["start_date"],
+        end_date=args["end_date"],
+        review_type=args.get("review_type", "period"),
+    )
+
+@_handler("tp_coach_week_context")
+async def _h_coach_week_context(args):
+    return await tp_coach_week_context(week_of=args.get("week_of"))
+
+@_handler("tp_coach_readiness_snapshot")
+async def _h_coach_readiness_snapshot(args):
+    return await tp_coach_readiness_snapshot(
+        date_str=args.get("date"), baseline_days=args.get("baseline_days", 28),
+    )
+
+@_handler("tp_coach_workout_compliance_v2")
+async def _h_coach_workout_compliance_v2(args):
+    return await tp_coach_workout_compliance_v2(workout_id=args["workout_id"])
+
+@_handler("tp_coach_plan_guardrails")
+async def _h_coach_plan_guardrails(args):
+    return await tp_coach_plan_guardrails(
+        plan=args["plan"], availability_by_date=args.get("availability_by_date"),
+    )
+
 @_handler("tp_get_atp")
 async def _h_get_atp(args): return await tp_get_atp(start_date=args["start_date"], end_date=args["end_date"])
 
@@ -1202,6 +1364,10 @@ async def _h_update_nutrition(args): return await tp_update_nutrition(planned_ca
 
 @_handler("tp_get_pool_length_settings")
 async def _h_pool(args): return await tp_get_pool_length_settings()
+
+@_handler("tp_search_strength_exercises")
+async def _h_search_strength_exercises(args):
+    return await tp_search_strength_exercises(query=args["query"], limit=args.get("limit", 10))
 
 # --- Health Metrics ---
 @_handler("tp_log_metrics")

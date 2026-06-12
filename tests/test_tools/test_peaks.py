@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tp_mcp.client.http import APIResponse, ErrorCode
+from tp_mcp.client.http import APIResponse
 from tp_mcp.tools.peaks import tp_get_peaks, tp_get_workout_prs
 
 
@@ -17,9 +17,27 @@ class TestTpGetPeaks:
         peaks_response = APIResponse(
             success=True,
             data=[
-                {"rank": 1, "value": 350, "workoutId": 1001, "workoutTitle": "Best Ride", "workoutDate": "2025-01-05T00:00:00"},
-                {"rank": 2, "value": 340, "workoutId": 1002, "workoutTitle": "Good Ride", "workoutDate": "2025-01-03T00:00:00"},
-                {"rank": 3, "value": 330, "workoutId": 1003, "workoutTitle": "OK Ride", "workoutDate": "2025-01-01T00:00:00"},
+                {
+                    "rank": 1,
+                    "value": 350,
+                    "workoutId": 1001,
+                    "workoutTitle": "Best Ride",
+                    "workoutDate": "2025-01-05T00:00:00",
+                },
+                {
+                    "rank": 2,
+                    "value": 340,
+                    "workoutId": 1002,
+                    "workoutTitle": "Good Ride",
+                    "workoutDate": "2025-01-03T00:00:00",
+                },
+                {
+                    "rank": 3,
+                    "value": 330,
+                    "workoutId": 1003,
+                    "workoutTitle": "OK Ride",
+                    "workoutDate": "2025-01-01T00:00:00",
+                },
             ],
         )
 
@@ -53,7 +71,13 @@ class TestTpGetPeaks:
         peaks_response = APIResponse(
             success=True,
             data=[
-                {"rank": 1, "value": 4.5, "workoutId": 2001, "workoutTitle": "Fast 5K", "workoutDate": "2025-01-05T00:00:00"},
+                {
+                    "rank": 1,
+                    "value": 4.5,
+                    "workoutId": 2001,
+                    "workoutTitle": "Fast 5K",
+                    "workoutDate": "2025-01-05T00:00:00",
+                },
             ],
         )
 
