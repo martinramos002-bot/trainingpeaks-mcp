@@ -618,20 +618,20 @@ def _build_workout_summary(
         return dist
 
     # Sport breakdown
-    from collections import defaultdict
-    by_sport = defaultdict(lambda: {"sessions": 0, "tss": 0.0, "duration_h": 0.0})
+    by_sport: dict[str, dict[str, float]] = {}
     for w in completed:
         sport = _detect_sport(w)
         tss = _field_float(w, "tssActual", "tss_actual", "tss") or 0
         dur_min = _get_duration_min(w)
-        by_sport[sport]["sessions"] += 1
-        by_sport[sport]["tss"] += tss
-        by_sport[sport]["duration_h"] += dur_min / 60
+        bucket = by_sport.setdefault(sport, {"sessions": 0.0, "tss": 0.0, "duration_h": 0.0})
+        bucket["sessions"] += 1
+        bucket["tss"] += float(tss)
+        bucket["duration_h"] += dur_min / 60
 
     sport_summary = {}
     for sport, v in sorted(by_sport.items(), key=lambda x: -x[1]["tss"]):
         sport_summary[sport] = {
-            "sessions": v["sessions"],
+            "sessions": int(v["sessions"]),
             "tss": round(v["tss"], 1),
             "duration_hours": round(v["duration_h"], 1),
         }
@@ -699,7 +699,7 @@ def _build_workout_summary(
         ws = d - td(days=d.weekday())
         return ws.isoformat()
 
-    weekly = defaultdict(lambda: {"tss": 0.0, "sessions": 0, "sports": defaultdict(lambda: {"count": 0, "tss": 0.0})})
+    weekly: dict[str, Any] = {}
     for w in completed:
         d = _workout_date(w)
         if not d:
@@ -707,10 +707,13 @@ def _build_workout_summary(
         ws_key = week_start(d)
         tss = _field_float(w, "tssActual", "tss_actual", "tss") or 0
         sport = _detect_sport(w)
-        weekly[ws_key]["tss"] += tss
-        weekly[ws_key]["sessions"] += 1
-        weekly[ws_key]["sports"][sport]["count"] += 1
-        weekly[ws_key]["sports"][sport]["tss"] += tss
+        bucket = weekly.setdefault(ws_key, {"tss": 0.0, "sessions": 0, "sports": {}})
+        bucket["tss"] += float(tss)
+        bucket["sessions"] += 1
+        sports = bucket["sports"]
+        sport_bucket = sports.setdefault(sport, {"count": 0, "tss": 0.0})
+        sport_bucket["count"] += 1
+        sport_bucket["tss"] += float(tss)
 
     weekly_table = []
     for ws_key in sorted(weekly.keys()):
@@ -725,7 +728,7 @@ def _build_workout_summary(
             "week_end": we,
             "week_label": f"{ws_key} to {we}",
             "tss": round(v["tss"], 1),
-            "sessions": v["sessions"],
+            "sessions": int(v["sessions"]),
             "sports": sport_str,
         })
 
@@ -751,9 +754,10 @@ def _build_workout_summary(
     # This prevents the recurring bug where the LLM reports "2 sessions"
     # when there are actually 3 (typically omitting Bike entries).
     rpe7_entries = [r for r in rpe_highlights if r.get("rpe", 0) >= 7]
-    rpe7_by_sport: dict[str, int] = defaultdict(int)
+    rpe7_by_sport: dict[str, int] = {}
     for r in rpe7_entries:
-        rpe7_by_sport[r.get("sport", "Unknown")] += 1
+        sport_key = str(r.get("sport", "Unknown"))
+        rpe7_by_sport[sport_key] = rpe7_by_sport.get(sport_key, 0) + 1
     rpe7_summary = {
         "total_count": len(rpe7_entries),
         "by_sport": dict(rpe7_by_sport),
@@ -987,11 +991,10 @@ def _compact_fitness(fitness_result: Any) -> dict[str, Any]:
         }
 
     # Weekly CTL/ATL/TSB summary from daily_data
-    from collections import defaultdict
     from datetime import date as date_cls
     from datetime import timedelta as td
 
-    weekly = defaultdict(lambda: {"ctl": [], "atl": [], "tsb": [], "tss": []})
+    weekly: dict[str, dict[str, list[float]]] = {}
     for entry in daily:
         d = entry.get("date", "")
         if not d:
@@ -1001,10 +1004,11 @@ def _compact_fitness(fitness_result: Any) -> dict[str, Any]:
         except (ValueError, TypeError):
             continue
         ws = (dt - td(days=dt.weekday())).isoformat()
-        weekly[ws]["ctl"].append(entry.get("ctl", 0))
-        weekly[ws]["atl"].append(entry.get("atl", 0))
-        weekly[ws]["tsb"].append(entry.get("tsb", 0))
-        weekly[ws]["tss"].append(entry.get("tss", 0))
+        bucket = weekly.setdefault(ws, {"ctl": [], "atl": [], "tsb": [], "tss": []})
+        bucket["ctl"].append(float(entry.get("ctl") or 0))
+        bucket["atl"].append(float(entry.get("atl") or 0))
+        bucket["tsb"].append(float(entry.get("tsb") or 0))
+        bucket["tss"].append(float(entry.get("tss") or 0))
 
     weekly_summary = []
     for ws in sorted(weekly.keys()):
@@ -1221,15 +1225,16 @@ def _build_coaching_assessment(
         if lr.get("date") and date_cls.fromisoformat(lr["date"]) >= recent_30d
     ]
     max_30d = max((lr.get("duration_min", 0) for lr in recent_long_runs), default=0)
-    max_30d_date = max(
+    max_30d_item: dict[str, Any] = max(
         (lr for lr in recent_long_runs if lr.get("duration_min", 0) == max_30d),
         key=lambda lr: lr.get("date", ""),
         default={},
-    ).get("date", "")
+    )
+    max_30d_date = max_30d_item.get("date", "")
 
     # ── D: Progression readiness inputs (VALUES, not pass/fail) ──────────
     # Provide raw values for each criterion. The LLM weighs them in context.
-    weekly = ws.get("weekly_breakdown", [])
+    weekly: list[dict[str, Any]] = ws.get("weekly_breakdown", []) or []
 
     # (1) Count weeks with 3+ runs
     weeks_with_3plus_runs = 0
@@ -1331,12 +1336,12 @@ def _build_coaching_assessment(
         cycle_start = date_cls.fromisoformat(bp["cycle_start_date"])
         cycle_weeks = bp.get("cycle_weeks", 4)
         phases = bp.get("phases", ["Carga 1", "Carga 2", "Carga 3", "Descarga"])
-        cycles_def = bp.get("cycles", [])
+        cycles_def: list[dict[str, Any]] = bp.get("cycles", []) or []
 
         if today < cycle_start:
             cycle_status = {"planned_status": "before_start", "note": f"Cycle starts {bp['cycle_start_date']}"}
         else:
-            current_cycle = None
+            current_cycle: dict[str, Any] | None = None
             week_in_cycle = 0
             for cyc in cycles_def:
                 cyc_start = date_cls.fromisoformat(cyc["start_date"])
@@ -1451,6 +1456,8 @@ def _build_coaching_assessment(
     # These are not recommendations. They prevent recurring omissions in global
     # reviews (stress, nadir, pain mentions, RPE+Feeling context, bridge/Pw:Hr).
     rpe7_line = "No RPE≥7 sessions in this period."
+    rpe7_summary = ws.get("rpe7_summary", {}) if isinstance(ws, dict) else {}
+    rpe7_summary_count = rpe7_summary.get("total_count") if isinstance(rpe7_summary, dict) else None
     if rpe7_sessions:
         rpe7_line = "; ".join(
             f"{s.get('date')} {s.get('sport')} RPE {s.get('rpe')} / Feeling {s.get('feeling_label')}"
@@ -1503,6 +1510,22 @@ def _build_coaching_assessment(
         for item in bridge_plan_table
     ) or "| N/A | Bridge plan not available | N/A |"
 
+    consistency_warnings: list[str] = []
+    if isinstance(rpe7_summary_count, int) and rpe7_summary_count != len(rpe7_sessions):
+        consistency_warnings.append(
+            f"rpe7_count_mismatch: workout_summary={rpe7_summary_count}, "
+            f"coaching_assessment={len(rpe7_sessions)}"
+        )
+    metrics_available = bool(isinstance(metrics_compact, dict) and metrics_compact.get("available"))
+    if metrics_available and not readiness_line:
+        consistency_warnings.append("metrics_compact_available_but_readiness_line_missing")
+    if fitness_historical and not historical_line:
+        consistency_warnings.append("fitness_historical_available_but_historical_line_missing")
+    if consistency_warnings:
+        consistency_warnings.append(
+            "Do not present a confident global narrative until these derived fact conflicts are reconciled."
+        )
+
     mandatory_block = (
         "## Global review facts to include\n"
         f"- **Readiness completo:** {readiness_line or 'no disponible'}\n"
@@ -1526,6 +1549,7 @@ def _build_coaching_assessment(
             "bridge_plan_table_or_summary",
             "pw_hr_status_pending_if_not_computed",
         ],
+        "consistency_warnings": consistency_warnings,
         "readiness_line_all_5_signals": readiness_line,
         "historical_trajectory_peak_nadir_current": historical_line,
         "pain_mentions_line": pain_mentions_line,
@@ -1949,6 +1973,8 @@ async def tp_coach_workout_compliance_v2(workout_id: str) -> dict[str, Any]:
     """Read-only composite post-workout compliance context."""
     from tp_mcp.tools.analyze import tp_analyze_workout
 
+    detail: Any
+    analysis: Any
     detail, analysis = await asyncio.gather(
         tp_get_workout(workout_id=workout_id),
         tp_analyze_workout(workout_id=workout_id),

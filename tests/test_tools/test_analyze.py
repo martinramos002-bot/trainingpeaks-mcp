@@ -185,10 +185,30 @@ class TestTpAnalyzeWorkout:
         assert len(result["dataChannels"]) == 2
         assert result["dataChannels"][0]["identifier"] == "Power"
         assert result["time_series_points"] == 3
-        assert "data_file" in result
-        assert result["data_file"].endswith(".json")
+        assert result["data_file"] is None
+        assert result["raw_saved"] is False
+        assert "raw_time_series_json" in result["omitted_fields"]
 
-        # Verify full data was saved to file
+    @pytest.mark.asyncio
+    async def test_success_save_raw_opt_in(self):
+        mock_client = _mock_tp_client()
+        analysis_data = _sample_analysis_response()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = analysis_data
+
+        with patch("tp_mcp.tools.analyze.TPClient") as mock_tp:
+            mock_tp.return_value.__aenter__.return_value = mock_client
+            with patch("tp_mcp.tools.analyze.httpx.AsyncClient") as mock_httpx:
+                mock_http_client = AsyncMock()
+                mock_http_client.post.return_value = mock_response
+                mock_httpx.return_value.__aenter__.return_value = mock_http_client
+
+                result = await tp_analyze_workout("3553733903", save_raw=True)
+
+        assert result["raw_saved"] is True
+        assert result["data_file"].endswith(".json")
         saved = json.loads(Path(result["data_file"]).read_text())
         assert saved["data"] == analysis_data["data"]
         assert saved["data"][0]["Power"] == 150

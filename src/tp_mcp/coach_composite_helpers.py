@@ -428,7 +428,7 @@ def summarize_feedback_patterns(workouts: list[dict[str, Any]]) -> dict[str, Any
     """Summarize RPE/Feeling/comments patterns from workout dicts."""
     rpes: list[float] = []
     feeling_labels: list[str] = []
-    flags = Counter()
+    flags: Counter[str] = Counter()
 
     for workout in workouts:
         rpe = as_float(workout.get("rpe"))

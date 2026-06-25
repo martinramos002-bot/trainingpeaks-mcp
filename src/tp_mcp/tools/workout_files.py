@@ -2,13 +2,14 @@
 
 import base64
 import gzip
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from tp_mcp.client import TPClient
 
-FILE_DATA_DIR = Path(tempfile.gettempdir()) / "tp-mcp" / "files"
+FILE_DATA_DIR = Path(os.environ.get("TP_MCP_FILE_DATA_DIR", Path(tempfile.gettempdir()) / "tp-mcp" / "files"))
 
 
 def _is_numeric_id(value: str, *, allow_negative: bool = False) -> bool:
@@ -51,12 +52,37 @@ def _parse_content_disposition_filename(value: str | None) -> str | None:
     return Path(filename).name if filename else None
 
 
-def _save_workout_file(workout_id: str, file_id: str, filename: str, data: bytes) -> str:
-    """Persist downloaded workout file and return absolute path."""
-    FILE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_download_path(output_path: str | None, workout_id: str, file_id: str, filename: str | None) -> Path | None:
+    """Resolve a download target inside FILE_DATA_DIR only.
+
+    Arbitrary output paths are intentionally rejected because workout files are
+    private health data and this tool may be exposed through read-mostly MCP
+    lanes. Relative output_path values are interpreted under FILE_DATA_DIR.
+    """
+    base = FILE_DATA_DIR.resolve()
     fallback_name = f"workout_{workout_id}_file_{file_id}.fit.gz"
     safe_name = Path(filename).name if filename else fallback_name
-    path = FILE_DATA_DIR / safe_name
+    if not output_path:
+        return base / safe_name
+    target = Path(output_path)
+    if not target.is_absolute():
+        target = base / target
+    if target.exists() and target.is_dir():
+        target = target / safe_name
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return None
+    return resolved
+
+def _save_workout_file(workout_id: str, file_id: str, filename: str, data: bytes) -> str:
+    """Persist downloaded workout file and return absolute path."""
+    path = _resolve_download_path(None, workout_id, file_id, filename)
+    assert path is not None
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return str(path.resolve())
 
@@ -232,23 +258,16 @@ async def tp_download_workout_file(
 
         filename = _parse_content_disposition_filename(response.content_disposition)
         content = response.content
-        if output_path:
-            target = Path(output_path)
-            if target.exists() and target.is_dir():
-                save_name = filename or f"workout_{workout_id}_file_{file_id}.fit.gz"
-                file_out = (target / Path(save_name).name).resolve()
-            else:
-                file_out = target.resolve()
-            file_out.parent.mkdir(parents=True, exist_ok=True)
-            file_out.write_bytes(content)
-            saved_to = str(file_out)
-        else:
-            saved_to = _save_workout_file(
-                workout_id=workout_id,
-                file_id=file_id,
-                filename=filename or "",
-                data=content,
-            )
+        file_out = _resolve_download_path(output_path, workout_id, file_id, filename)
+        if file_out is None:
+            return {
+                "isError": True,
+                "error_code": "UNSAFE_OUTPUT_PATH",
+                "message": f"output_path must stay inside {FILE_DATA_DIR.resolve()}",
+            }
+        file_out.parent.mkdir(parents=True, exist_ok=True)
+        file_out.write_bytes(content)
+        saved_to = str(file_out)
 
         return {
             "workout_id": workout_id,

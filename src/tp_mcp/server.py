@@ -417,7 +417,7 @@ TOOLS = [
     Tool(
         name="tp_download_workout_file",
         description=(
-            "Download a workout file by file_id."
+            "Download a workout file by file_id into the configured sandbox."
             " Get file_id from tp_get_workout device_files/attachment_files."
         ),
         inputSchema={
@@ -425,7 +425,10 @@ TOOLS = [
             "properties": {
                 "workout_id": {"type": "string", "description": "Workout ID"},
                 "file_id": {"type": "string", "description": "File ID from tp_get_workout"},
-                "output_path": {"type": "string", "description": "Directory or full path to save file"},
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional relative path under the configured TP_MCP_FILE_DATA_DIR sandbox.",
+                },
             },
             "required": ["workout_id", "file_id"],
         },
@@ -487,10 +490,19 @@ TOOLS = [
     ),
     Tool(
         name="tp_analyze_workout",
-        description="Get workout analysis: metrics, zones, laps. Saves full time-series to JSON file.",
+        description=(
+            "Get workout analysis: metrics, zones, laps. Raw time-series JSON is not saved unless save_raw=true."
+        ),
         inputSchema={
             "type": "object",
-            "properties": {"workout_id": {"type": "string"}},
+            "properties": {
+                "workout_id": {"type": "string"},
+                "save_raw": {
+                    "type": "boolean",
+                    "description": "Opt-in: save full raw time-series JSON to the configured sandbox.",
+                    "default": False,
+                },
+            },
             "required": ["workout_id"],
         },
     ),
@@ -1301,7 +1313,8 @@ async def _h_get_peaks(args):
     return await tp_get_peaks(sport=args["sport"], pr_type=args["pr_type"], days=args.get("days", 3650))
 
 @_handler("tp_analyze_workout")
-async def _h_analyze(args): return await tp_analyze_workout(workout_id=args["workout_id"])
+async def _h_analyze(args):
+    return await tp_analyze_workout(workout_id=args["workout_id"], save_raw=bool(args.get("save_raw", False)))
 
 # --- Fitness & Summary ---
 @_handler("tp_get_fitness")

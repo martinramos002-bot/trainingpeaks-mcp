@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,9 @@ logger = logging.getLogger("tp-mcp")
 
 ANALYSIS_API_BASE = "https://api.peakswaresb.com"
 ANALYSIS_TIMEOUT = 60.0
-ANALYSIS_DATA_DIR = Path(tempfile.gettempdir()) / "tp-mcp" / "analysis"
+ANALYSIS_DATA_DIR = Path(
+    os.environ.get("TP_MCP_ANALYSIS_DATA_DIR", Path(tempfile.gettempdir()) / "tp-mcp" / "analysis")
+)
 
 
 def _save_analysis_json(workout_id: int, data: dict[str, Any]) -> str:
@@ -31,13 +34,14 @@ def _save_analysis_json(workout_id: int, data: dict[str, Any]) -> str:
     return str(filepath)
 
 
-async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
+async def tp_analyze_workout(workout_id: str, save_raw: bool = False) -> dict[str, Any]:
     """Get detailed workout analysis including metrics, zones, and lap data.
 
-    Full time-series data is saved to a JSON file for further analysis.
+    Full time-series data is saved only when save_raw=True.
 
     Args:
         workout_id: The workout ID (from tp_get_workouts).
+        save_raw: When True, persist full raw time-series JSON to the configured sandbox.
 
     Returns:
         Dict with totals, data channels, lap data, and path to full data file.
@@ -149,10 +153,9 @@ async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
             "message": "Failed to parse workout analysis.",
         }
 
-    # Save full raw data (including time-series) to file
-    data_file = _save_analysis_json(wid, raw_data)
+    data_file = _save_analysis_json(wid, raw_data) if save_raw else None
 
-    # Return summary inline, point to file for full data
+    # Return summary inline. Full raw data is opt-in because it can contain private time-series.
     totals = {t.name: {"value": t.value, "unit": t.unit} for t in analysis.totals}
 
     channels = [
@@ -182,4 +185,6 @@ async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
         "lapColumns": analysis.lap_columns,
         "time_series_points": len(analysis.data),
         "data_file": data_file,
+        "raw_saved": bool(data_file),
+        "omitted_fields": [] if data_file else ["raw_time_series_json"],
     }
