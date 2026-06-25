@@ -239,6 +239,29 @@ def classify_readiness_snapshot(
             flags.append("tsb_negative")
             severity += 1
 
+    # Body Battery wake value (max of array) as readiness support
+    bb_raw = latest_metrics.get("body_battery")
+    if bb_raw is None:
+        bb_raw = latest_metrics.get("Body Battery")
+    if bb_raw is not None:
+        bb_wake: float | None = None
+        if isinstance(bb_raw, list):
+            bb_nums = [metric_value({"value": v}, "value") for v in bb_raw]
+            bb_nums = [v for v in bb_nums if v is not None]
+            if len(bb_nums) >= 2:
+                bb_wake = bb_nums[1]  # max = wake value
+            elif bb_nums:
+                bb_wake = bb_nums[0]
+        else:
+            bb_wake = metric_value({"body_battery": bb_raw}, "body_battery")
+        if bb_wake is not None:
+            if bb_wake < 30:
+                flags.append("body_battery_low_wake")
+                severity += 2
+            elif bb_wake < 50:
+                flags.append("body_battery_borderline_wake")
+                severity += 1
+
     normalized_subjective = {f.lower().strip() for f in subjective_flags}
     if normalized_subjective & {"illness", "sick", "fever", "red", "acute_pain"}:
         flags.append("subjective_red_flag")
@@ -271,11 +294,31 @@ def classify_readiness_snapshot(
     }
 
 
+def _planned_distance_km(item: dict[str, Any]) -> float:
+    """Extract a planned distance in km from a plan day item, tolerating naming variants."""
+    for key in ("distance_km", "distance_planned_km", "distance_min", "distance_planned", "planned_distance_km"):
+        value = as_float(item.get(key))
+        if value:
+            return value
+    return 0.0
+
+
 def validate_week_plan_guardrails(
     plan: dict[str, Any],
     availability_by_date: dict[str, dict[str, Any]] | None = None,
+    *,
+    long_run_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate Fitnessbot weekly-plan guardrails before any TP write."""
+    """Validate Fitnessbot weekly-plan guardrails before any TP write.
+
+    ``long_run_history`` is an optional list of recent long-run sessions used to
+    enforce the SOUL.md 10% rule: no planned session may exceed 110% of the
+    longest long run in the last 30 days. Each entry should carry a ``date`` (or
+    ``workoutDay``) and a distance in km under any of the keys
+    ``distance_km``/``distance_actual_km``/``distance_planned_km``. Entries
+    older than 30 days from today are ignored. When the list is empty or not
+    provided, a soft warning is emitted instead of a violation.
+    """
     availability_by_date = availability_by_date or {}
     days = plan.get("days") or plan.get("workouts") or []
     violations: list[str] = []
@@ -286,6 +329,31 @@ def validate_week_plan_guardrails(
         violations.append("multiple_primary_priorities")
     elif not priority:
         warnings.append("primary_priority_missing")
+
+    # --- 10% long-run rule setup -------------------------------------------
+    recent_long_run_max_km = 0.0
+    long_run_history = long_run_history or []
+    today = date.today()
+    thirty_days_ago = today - timedelta(days=30)
+    for entry in long_run_history:
+        entry_day_raw = str(entry.get("date") or entry.get("workoutDay") or "")[:10]
+        try:
+            entry_day = date.fromisoformat(entry_day_raw) if entry_day_raw else None
+        except ValueError:
+            entry_day = None
+        if entry_day is not None and entry_day < thirty_days_ago:
+            continue
+        dist = 0.0
+        for key in ("distance_km", "distance_actual_km", "distance_planned_km"):
+            value = as_float(entry.get(key))
+            if value:
+                dist = value
+                break
+        if dist > recent_long_run_max_km:
+            recent_long_run_max_km = dist
+
+    long_run_rule_cap_km = recent_long_run_max_km * 1.10 if recent_long_run_max_km > 0 else None
+    long_run_rule_active = long_run_rule_cap_km is not None
 
     run_quality = 0
     has_long_run = False
@@ -315,6 +383,15 @@ def validate_week_plan_guardrails(
             if any(k in intensity for k in ("long", "tirada", "larga")) or duration >= 75:
                 has_long_run = True
 
+            # 10% long-run rule: check every run session's planned distance.
+            if long_run_rule_active:
+                planned_km = _planned_distance_km(item)
+                if planned_km > 0 and planned_km > long_run_rule_cap_km:  # type: ignore[operator]
+                    violations.append(
+                        f"long_run_exceeds_10pct_rule:{day}:{round(planned_km, 1)}km>"
+                        f"{round(long_run_rule_cap_km, 1)}km"
+                    )
+
     if run_quality >= 2:
         violations.append("too_many_run_quality_sessions")
     if has_long_run and run_quality >= 1 and len(days) < 5:
@@ -323,6 +400,9 @@ def validate_week_plan_guardrails(
         warnings.append("strength_or_mobility_missing")
     if total_duration and total_tss and total_tss / max(total_duration / 60.0, 0.01) > 90:
         warnings.append("high_tss_density_check_thresholds")
+
+    if not long_run_rule_active:
+        warnings.append("long_run_10pct_rule_not_evaluated_no_history")
 
     return {
         "ok": not violations,
@@ -335,6 +415,11 @@ def validate_week_plan_guardrails(
             "has_strength_or_mobility": has_strength_or_mobility,
             "run_quality_sessions": run_quality,
             "has_long_run": has_long_run,
+            "long_run_10pct_rule": {
+                "active": long_run_rule_active,
+                "recent_long_run_max_km": round(recent_long_run_max_km, 2) if recent_long_run_max_km else None,
+                "cap_km": round(long_run_rule_cap_km, 2) if long_run_rule_cap_km else None,
+            },
         },
     }
 

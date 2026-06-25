@@ -2,12 +2,13 @@
 
 import base64
 import os
+from unittest.mock import patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from tp_mcp.auth import encrypted as _enc
 from tp_mcp.auth.encrypted import (
-    CREDENTIALS_FILE,
     EncryptedCredentialStore,
     _derive_key,
     _derive_key_legacy,
@@ -15,11 +16,23 @@ from tp_mcp.auth.encrypted import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_credentials():
-    """Remove credential file before and after each test."""
-    CREDENTIALS_FILE.unlink(missing_ok=True)
-    yield
-    CREDENTIALS_FILE.unlink(missing_ok=True)
+def _isolated_credentials(tmp_path):
+    """Use a temporary directory for credential storage — NEVER touch the real file.
+
+    This fixture patches CREDENTIALS_FILE to point to a temp directory so that
+    the real credential file at ~/.config/trainingpeaks-mcp/credentials.enc is
+    never deleted by tests.  Previous versions of this fixture called
+    ``CREDENTIALS_FILE.unlink(missing_ok=True)`` which deleted the real
+    credential file when tests ran on the production server.
+    """
+    tmp_cred = tmp_path / "credentials.enc"
+    # Patch the module-level CREDENTIALS_FILE used by EncryptedCredentialStore
+    # and CONFIG_DIR in case any code references it.
+    with (
+        patch("tp_mcp.auth.encrypted.CREDENTIALS_FILE", tmp_cred),
+        patch("tp_mcp.auth.encrypted.CONFIG_DIR", tmp_path),
+    ):
+        yield
 
 
 class TestDeriveKey:
@@ -73,8 +86,8 @@ class TestEncryptedCredentialStore:
         nonce = os.urandom(12)
         aesgcm = AESGCM(legacy_key)
         ciphertext = aesgcm.encrypt(nonce, b"legacy-cookie", None)
-        CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CREDENTIALS_FILE.write_bytes(base64.b64encode(nonce + ciphertext))
+        _enc.CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _enc.CREDENTIALS_FILE.write_bytes(base64.b64encode(nonce + ciphertext))
 
         # Retrieve via store (should fall back to legacy and migrate)
         store = EncryptedCredentialStore()
@@ -91,8 +104,8 @@ class TestEncryptedCredentialStore:
 
     def test_decryption_failure_returns_error(self):
         """Corrupted file should return a graceful error."""
-        CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CREDENTIALS_FILE.write_bytes(base64.b64encode(b"corrupted-data-here!!"))
+        _enc.CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _enc.CREDENTIALS_FILE.write_bytes(base64.b64encode(b"corrupted-data-here!!"))
 
         store = EncryptedCredentialStore()
         result = store.get()

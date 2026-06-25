@@ -547,6 +547,17 @@ TOOLS = [
             "Composite read-only Fitnessbot period review context for weekly, monthly, and block analyses. "
             "Fetches workouts/load/metrics/settings/notes/availability and expands missed, key, and "
             "plan-vs-actual anomalous workouts with tp_get_workout plus private notes before causal claims. "
+            "When review_type is 'block' or 'global', or the period exceeds 30 days, automatically includes "
+            "fitness_historical: a full 2024-01-01-to-today CTL/ATL/TSB query with computed peak CTL, "
+            "peak date, nadir, % of peak, monthly averages, and top 5 peaks. This field is the GROUND TRUTH "
+            "for historical CTL comparisons — do NOT cite any other peak value. "
+            "Also includes workout_summary (compact pre-computed long run progression, weekly TSS with dates "
+            "and sport breakdown, milestones, and sport totals), metrics_compact (averages + latest for "
+            "HRV/sleep/pulse/Body Battery/stress), and fitness_compact (current CTL/ATL/TSB + weekly summary). "
+            "USE workout_summary, metrics_compact, and fitness_compact for narrative — "
+            "do NOT call tp_get_fitness or tp_get_metrics separately for data already in these summaries. "
+            "If you need full detail on a specific workout (laps, power, comments), call tp_get_workout with "
+            "the id from expanded_workout_highlights."
             "Use before weekly/monthly reviews and plan adjustments; never writes."
         ),
         inputSchema={

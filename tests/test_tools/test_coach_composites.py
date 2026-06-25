@@ -3,7 +3,7 @@
 These are pure helpers first: no TrainingPeaks network calls, no writes.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -90,7 +90,7 @@ def test_metric_dict_for_date_accepts_trainingpeaks_timestamp_camel_case():
     assert freshness["is_current_day"] is True
 
 
-def test_body_battery_interpretation_reports_trainingpeaks_array_without_wake_overclaim():
+def test_body_battery_interpretation_reports_trainingpeaks_array_with_wake_value():
     result = coach_composites._body_battery_interpretation({"body_battery": [63, 100, 90.4085]})
 
     assert result is not None
@@ -98,9 +98,11 @@ def test_body_battery_interpretation_reports_trainingpeaks_array_without_wake_ov
     assert result["min"] == 63
     assert result["max"] == 100
     assert result["avg"] == 90.4
-    assert "63→100" in result["display_guidance"]
+    assert result["wake_value"] == 100
+    assert result["recovery_support"] == "strong"
+    assert "100 al despertar" in result["display_guidance"]
     assert "no permiso para sumar carga" in result["display_guidance"]
-    assert "unless that timestamp is explicitly confirmed" in result["coaching_rule"]
+    assert "wake/end-of-sleep value by Garmin" in result["coaching_rule"]
 
 
 def test_metric_dict_for_date_marks_yesterday_fallback_as_stale():
@@ -148,8 +150,8 @@ async def test_readiness_snapshot_never_presents_stale_metrics_as_today(monkeypa
     assert result["decision_guardrails"]["explain_freshness_status_plainly"] is True
     assert "Body Battery" in result["decision_guardrails"]["affected_readiness_signals_to_name"]
     assert "source_date/requested_date" in result["decision_guardrails"]["if_stale_or_missing"]
-    assert "pre-sleep" in result["decision_guardrails"]["body_battery_rule"]
-    assert "range 63→100" in result["decision_guardrails"]["body_battery_rule"]
+    assert "wake/end-of-sleep value by Garmin" in result["decision_guardrails"]["body_battery_rule"]
+    assert "highest and lowest" in result["decision_guardrails"]["body_battery_rule"]
     assert "not an alarm" in result["decision_guardrails"]["load_language_rule"]
     assert "mechanical legs/impact" in result["decision_guardrails"]["combined_readiness_load_rule"]
     assert result["classification"]["traffic_light"] == "unknown_stale_metrics"
@@ -188,7 +190,9 @@ async def test_readiness_snapshot_separates_physiology_from_session_load_and_rec
     assert result["readiness_layers"]["physiological_readiness"]["traffic_light"] == "green"
     assert result["readiness_layers"]["session_decision"]["traffic_light"] == "yellow"
     assert "physiological readiness is green" in result["readiness_layers"]["reporting_rule"]
-    assert result["body_battery_interpretation"]["display_guidance"].startswith("Body Battery: rango TP")
+    assert result["body_battery_interpretation"]["display_guidance"].startswith("Body Battery:")
+    assert "al despertar" in result["body_battery_interpretation"]["display_guidance"]
+    assert result["body_battery_interpretation"]["wake_value"] == 100
     assert "does not authorize extending" in result["decision_guardrails"]["good_readiness_does_not_add_load_rule"]
     assert "10-15 W" in result["decision_guardrails"]["recovery_execution_fallback_rule"]
     assert "3-5 evidence bullets" in result["decision_guardrails"]["brevity_rule"]
@@ -224,6 +228,112 @@ def test_validate_week_plan_guardrails_warns_when_strength_missing():
 
     assert result["ok"] is True
     assert "strength_or_mobility_missing" in result["warnings"]
+    # Without long-run history the 10% rule emits a soft warning, not a violation.
+    assert "long_run_10pct_rule_not_evaluated_no_history" in result["warnings"]
+    assert result["summary"]["long_run_10pct_rule"]["active"] is False
+
+
+def _recent_iso(days_ago: int) -> str:
+    return (date.today() - timedelta(days=days_ago)).isoformat()
+
+
+def test_validate_week_plan_guardrails_blocks_long_run_exceeding_10pct_rule():
+    """A planned long run above 110% of the 30-day max is a violation."""
+    plan = {
+        "priority": "long_run",
+        "days": [
+            # 18 km long run when the recent max is 15 km → cap is 16.5 km.
+            {"date": "2026-06-21", "sport": "Run", "intensity": "long", "duration_min": 110, "distance_km": 18.0},
+            {"date": "2026-06-22", "sport": "Run", "intensity": "easy", "duration_min": 40},
+            {"date": "2026-06-23", "sport": "Strength", "intensity": "fuerza", "duration_min": 30},
+        ],
+    }
+    history = [
+        {"date": _recent_iso(10), "distance_km": 15.0},
+        {"date": _recent_iso(20), "distance_km": 12.0},
+    ]
+
+    result = validate_week_plan_guardrails(plan, {}, long_run_history=history)
+
+    assert result["ok"] is False
+    long_run_violations = [v for v in result["violations"] if v.startswith("long_run_exceeds_10pct_rule")]
+    assert len(long_run_violations) == 1
+    assert "2026-06-21" in long_run_violations[0]
+    assert "18.0km" in long_run_violations[0]
+    # Cap = 15 * 1.10 = 16.5
+    assert "16.5km" in long_run_violations[0]
+    assert result["summary"]["long_run_10pct_rule"]["active"] is True
+    assert result["summary"]["long_run_10pct_rule"]["recent_long_run_max_km"] == 15.0
+    assert result["summary"]["long_run_10pct_rule"]["cap_km"] == 16.5
+
+
+def test_validate_week_plan_guardrails_allows_long_run_within_10pct_rule():
+    """A planned long run at exactly 110% of the max is allowed (boundary)."""
+    plan = {
+        "priority": "long_run",
+        "days": [
+            # 16.5 km == cap (15 * 1.10); not strictly greater, so allowed.
+            {"date": "2026-06-21", "sport": "Run", "intensity": "long", "duration_min": 110, "distance_km": 16.5},
+            {"date": "2026-06-22", "sport": "Run", "intensity": "easy", "duration_min": 40},
+            {"date": "2026-06-23", "sport": "Strength", "intensity": "fuerza", "duration_min": 30},
+        ],
+    }
+    history = [{"date": _recent_iso(7), "distance_km": 15.0}]
+
+    result = validate_week_plan_guardrails(plan, {}, long_run_history=history)
+
+    assert result["ok"] is True
+    assert not any(v.startswith("long_run_exceeds_10pct_rule") for v in result["violations"])
+    assert result["summary"]["long_run_10pct_rule"]["active"] is True
+
+
+def test_validate_week_plan_guardrails_ignores_long_run_history_older_than_30_days():
+    """Entries older than 30 days must not count toward the recent max."""
+    plan = {
+        "priority": "long_run",
+        "days": [
+            # 14 km exceeds the 13.2 km cap derived from the recent 12 km max,
+            # but would pass if the 60-day-old 30 km entry were (wrongly)
+            # counted (cap would be 33 km). This proves only recent entries drive
+            # the rule.
+            {"date": "2026-06-21", "sport": "Run", "intensity": "long", "duration_min": 110, "distance_km": 14.0},
+            {"date": "2026-06-22", "sport": "Strength", "intensity": "fuerza", "duration_min": 30},
+        ],
+    }
+    # 60-day-old 30 km run should be ignored; only the 10-day-old 12 km counts.
+    # Cap from recent = 13.2; 14 > 13.2 → violation.
+    history = [
+        {"date": _recent_iso(60), "distance_km": 30.0},
+        {"date": _recent_iso(10), "distance_km": 12.0},
+    ]
+
+    result = validate_week_plan_guardrails(plan, {}, long_run_history=history)
+
+    # The 14 km run violates the 13.2 km cap derived from the recent 12 km max.
+    assert result["ok"] is False
+    assert result["summary"]["long_run_10pct_rule"]["recent_long_run_max_km"] == 12.0
+    assert result["summary"]["long_run_10pct_rule"]["cap_km"] == round(12.0 * 1.10, 2)
+    long_run_violations = [v for v in result["violations"] if v.startswith("long_run_exceeds_10pct_rule")]
+    assert len(long_run_violations) == 1
+
+
+def test_validate_week_plan_guardrails_10pct_rule_only_checks_run_sessions():
+    """Bike/strength sessions with large distances must not trigger the run rule."""
+    plan = {
+        "priority": "z2_base",
+        "days": [
+            # A 40 km bike ride must not be flagged by the run-only 10% rule.
+            {"date": "2026-06-21", "sport": "Bike", "intensity": "z2", "duration_min": 120, "distance_km": 40.0},
+            {"date": "2026-06-22", "sport": "Run", "intensity": "easy", "duration_min": 40, "distance_km": 6.0},
+            {"date": "2026-06-23", "sport": "Strength", "intensity": "fuerza", "duration_min": 30},
+        ],
+    }
+    history = [{"date": _recent_iso(7), "distance_km": 15.0}]
+
+    result = validate_week_plan_guardrails(plan, {}, long_run_history=history)
+
+    assert result["ok"] is True
+    assert not any(v.startswith("long_run_exceeds_10pct_rule") for v in result["violations"])
 
 
 def test_summarize_feedback_patterns_maps_feeling_code_and_counts_risk_flags():
@@ -406,13 +516,13 @@ async def test_period_review_context_expands_missed_key_and_anomalous_workouts(m
 
     result = await coach_composites.tp_coach_period_review_context("2026-05-31", "2026-06-06", "weekly")
 
-    expanded_ids = {item["id"] for item in result["expanded_workouts"]}
+    expanded_ids = {item["id"] for item in result["expanded_workout_highlights"]}
     assert expanded_ids == {"missed-1", "key-1"}
     assert ("detail", "missed-1") in calls
     assert ("private_note", "missed-1") in calls
     assert ("detail", "key-1") in calls
     assert ("detail", "easy-1") not in calls
-    missed = next(item for item in result["expanded_workouts"] if item["id"] == "missed-1")
+    missed = next(item for item in result["expanded_workout_highlights"] if item["id"] == "missed-1")
     assert missed["reason"]["category"] == "time_logistics"
     assert result["decision_guardrails"]["must_expand_notable_workouts_before_causal_claims"] is True
     assert result["decision_guardrails"]["can_make_period_causal_claims"] is True

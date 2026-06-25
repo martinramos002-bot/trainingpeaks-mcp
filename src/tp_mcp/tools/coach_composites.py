@@ -7,6 +7,7 @@ Do not add create/update/delete behavior here.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import date, timedelta
 from typing import Any
 
@@ -122,24 +123,38 @@ def _body_battery_interpretation(latest_metrics: dict[str, Any]) -> dict[str, An
         "source_semantics": "TrainingPeaks Garmin Body Battery metric",
         "coaching_rule": (
             "Use as recovery-support evidence, not as permission to add training load. "
-            "If the source only provides a range/list, do not call any value the wake/end-of-sleep value "
-            "unless that timestamp is explicitly confirmed."
+            "The max value of the array IS the wake/end-of-sleep value by Garmin's design "
+            "(per Garmin official: Body Battery is fullest in the morning when you wake up; "
+            "TP syncs 'the highest and lowest value for each day'). Use the max as the primary "
+            "readiness number. Frame it as recovery support, not permission to add load."
         ),
     }
     if isinstance(raw, list):
         nums = [metric_value({"value": v}, "value") for v in raw]
         nums = [v for v in nums if v is not None]
         if len(nums) >= 3:
+            bb_min = round(nums[0], 1)
+            bb_max = round(nums[1], 1)
+            bb_avg = round(nums[2], 1)
             interpretation.update({
                 "format": "array_min_max_avg",
-                "min": round(nums[0], 1),
-                "max": round(nums[1], 1),
-                "avg": round(nums[2], 1),
+                "min": bb_min,
+                "max": bb_max,
+                "avg": bb_avg,
+                "wake_value": bb_max,
                 "display_guidance": (
-                    f"Body Battery: rango TP aprox. {nums[0]:.0f}→{nums[1]:.0f}, promedio ~{nums[2]:.0f}; "
+                    f"Body Battery: {bb_max:.0f} al despertar "
+                    f"(mínimo del día: {bb_min:.0f}, promedio: {bb_avg:.0f}); "
                     "señal de recuperación, no permiso para sumar carga."
                 ),
             })
+            # Readiness support level based on wake value (max)
+            if bb_max >= 80:
+                interpretation["recovery_support"] = "strong"
+            elif bb_max >= 50:
+                interpretation["recovery_support"] = "moderate"
+            else:
+                interpretation["recovery_support"] = "low"
         elif nums:
             interpretation.update({"format": "array_values", "values": [round(v, 1) for v in nums]})
     else:
@@ -148,10 +163,17 @@ def _body_battery_interpretation(latest_metrics: dict[str, Any]) -> dict[str, An
             interpretation.update({
                 "format": "single_value",
                 "value": round(value, 1),
+                "wake_value": round(value, 1),
                 "display_guidance": (
                     f"Body Battery: {value:.0f}; señal de recuperación, no permiso para sumar carga."
                 ),
             })
+            if value >= 80:
+                interpretation["recovery_support"] = "strong"
+            elif value >= 50:
+                interpretation["recovery_support"] = "moderate"
+            else:
+                interpretation["recovery_support"] = "low"
     return interpretation
 
 
@@ -494,6 +516,1050 @@ async def tp_coach_daily_brief_context(date_str: str | None = None) -> dict[str,
     }
 
 
+# ── Compact summary builders ────────────────────────────────────────────────
+# These functions produce small, pre-computed summaries that the LLM can use
+# directly for narrative without parsing 300K+ chars of raw tool output.
+# Inspired by the "summary + drill-down" pattern from MCP community best
+# practices (GitHub discussions, Context Mode, arxiv:2511.22729): the tool
+# returns a compact summary up front and keeps full data available for
+# drill-down. This prevents context overflow from hiding recent workouts.
+
+
+# Map workoutTypeValueId to sport name (verified from TP API samples).
+_SPORT_MAP = {2: "Bike", 3: "Run", 1: "Swim", 9: "Strength", 100: "Other", 10: "Note", 7: "Rest", 13: "Other2"}
+
+
+def _sport_name(type_id: Any) -> str:
+    return _SPORT_MAP.get(type_id, f"Type{type_id}")
+
+
+def _detect_sport_from_expanded(ew: dict[str, Any]) -> str:
+    """Detect sport from an expanded workout dict.
+
+    Expanded workouts store the raw workout under 'list_view', which has
+    the sport/workoutTypeValueId fields. Also check top-level for safety.
+    """
+    # Check top-level first
+    sport = ew.get("sport")
+    if isinstance(sport, str) and sport:
+        return sport
+    type_id = ew.get("workoutTypeValueId") or ew.get("workout_type_value_id")
+    if type_id is not None:
+        return _sport_name(type_id)
+    # Check inside list_view (the raw workout object)
+    list_view = ew.get("list_view")
+    if isinstance(list_view, dict):
+        lv_sport = list_view.get("sport")
+        if isinstance(lv_sport, str) and lv_sport:
+            return lv_sport
+        lv_type_id = list_view.get("workoutTypeValueId") or list_view.get("workout_type_value_id")
+        if lv_type_id is not None:
+            return _sport_name(lv_type_id)
+    return "Unknown"
+
+
+def _build_workout_summary(
+    raw_workouts_result: Any,
+    expanded_workouts: list[dict[str, Any]],
+    period_days: int | None = None,
+) -> dict[str, Any]:
+    """Build a compact summary of workouts for the LLM narrative.
+
+    This replaces the need for the LLM to parse 54+ raw workouts and 26+
+    expanded workouts (147K+ chars). Instead it gets:
+    - Total counts and TSS by sport
+    - Long run progression with dates, durations, distances, TSS
+    - Weekly TSS with dates, sport breakdown, and session counts
+    - Key milestones (new maximums, firsts, notable sessions)
+    - RPE/feeling highlights from expanded workouts
+    All in ~2-3K chars instead of 147K.
+    """
+    workouts = _workouts_list(raw_workouts_result)
+
+    # Sport detection: the normalized workout format from tp_get_workouts has a
+    # "sport" string field ("Run", "Bike", "Strength", etc.). The raw TP API
+    # format has workoutTypeValueId (int). Support both.
+    def _detect_sport(w: dict[str, Any]) -> str:
+        sport = w.get("sport")
+        if isinstance(sport, str) and sport:
+            return sport
+        type_id = w.get("workoutTypeValueId")
+        return _sport_name(type_id)
+
+    # Duration detection: normalized format uses duration_actual (hours decimal),
+    # raw API uses totalTime (hours decimal). Both are in hours.
+    def _get_duration_min(w: dict[str, Any]) -> float:
+        dur_h = _field_float(w, "duration_actual", "durationActual", "totalTime") or 0
+        return dur_h * 60 if dur_h < 10 else dur_h  # TP stores hours as decimal
+
+    # Filter out spurious sessions: Garmin sync artifacts (Other sport, <5 TSS, <3 min)
+    # These contaminate counts and narratives (rule #49). Auto-filter in code.
+    def _is_spurious(w: dict[str, Any]) -> bool:
+        sport = _detect_sport(w)
+        if sport != "Other":
+            return False
+        tss = _field_float(w, "tssActual", "tss_actual", "tss") or 0
+        dur_min = _get_duration_min(w)
+        return tss < 5 and dur_min < 3
+
+    completed = [
+        w for w in workouts
+        if _field_float(w, "tssActual", "tss_actual", "tss")
+        and (_field_float(w, "tssActual", "tss_actual", "tss") or 0) > 0
+        and not _is_spurious(w)
+    ]
+
+    # Distance detection: normalized format uses distance_actual_km (already km),
+    # raw API uses distance (meters). Detect by magnitude.
+    def _get_distance_km(w: dict[str, Any]) -> float:
+        dist = _field_float(w, "distance_actual_km", "distanceActual", "distance", "distance_actual") or 0
+        if dist > 100:  # meters — convert
+            return dist / 1000
+        return dist
+
+    # Sport breakdown
+    from collections import defaultdict
+    by_sport = defaultdict(lambda: {"sessions": 0, "tss": 0.0, "duration_h": 0.0})
+    for w in completed:
+        sport = _detect_sport(w)
+        tss = _field_float(w, "tssActual", "tss_actual", "tss") or 0
+        dur_min = _get_duration_min(w)
+        by_sport[sport]["sessions"] += 1
+        by_sport[sport]["tss"] += tss
+        by_sport[sport]["duration_h"] += dur_min / 60
+
+    sport_summary = {}
+    for sport, v in sorted(by_sport.items(), key=lambda x: -x[1]["tss"]):
+        sport_summary[sport] = {
+            "sessions": v["sessions"],
+            "tss": round(v["tss"], 1),
+            "duration_hours": round(v["duration_h"], 1),
+        }
+
+    # Long run progression (Run sport, >=45 min, sorted by date)
+    # Enriched with RPE + Feeling from expanded_workouts (cross-reference by date+sport)
+    # Key: use (date, sport) tuple to avoid cross-contamination when multiple
+    # workouts exist on the same date (e.g., Run + Strength on same day).
+    expanded_by_date_sport: dict[tuple[str, str], dict] = {}
+    for ew in expanded_workouts:
+        d = ew.get("date")
+        s = _detect_sport_from_expanded(ew)
+        if d:
+            expanded_by_date_sport[(d, s)] = ew
+
+    long_runs = []
+    for w in completed:
+        sport = _detect_sport(w)
+        if sport != "Run":
+            continue
+        dur_min = _get_duration_min(w)
+        if dur_min >= 45:
+            d = _workout_date(w)
+            # Cross-reference with expanded_workouts for RPE/Feeling
+            # Use (date, sport) key to avoid matching wrong sport on same-day workouts
+            ew = expanded_by_date_sport.get((d, "Run"), {})
+            sf = ew.get("subjective_feedback") or {}
+            rpe = sf.get("rpe") if isinstance(sf, dict) else None
+            feeling = sf.get("feeling") if isinstance(sf, dict) else None
+            entry: dict[str, Any] = {
+                "date": d,
+                "duration_min": round(dur_min),
+                "distance_km": round(_get_distance_km(w), 1),
+                "tss": round(_field_float(w, "tssActual", "tss_actual", "tss") or 0, 1),
+                "title": _workout_title(w),
+            }
+            # Add RPE/Feeling if available (may be None for older sessions)
+            if rpe is not None:
+                entry["rpe"] = rpe
+            if feeling and isinstance(feeling, dict):
+                entry["feeling"] = feeling.get("label", "")
+                entry["feeling_score_1_to_5"] = feeling.get("score_1_to_5")
+            elif feeling and isinstance(feeling, str):
+                entry["feeling"] = feeling
+            long_runs.append(entry)
+    long_runs.sort(key=lambda x: x["date"])
+
+    # Find new maximums
+    max_dur = 0
+    milestones = []
+    for lr in long_runs:
+        if lr["duration_min"] > max_dur:
+            max_dur = lr["duration_min"]
+            if max_dur > 0:
+                milestones.append(
+                    f"New long run max: {max_dur} min on {lr['date']} "
+                    f"({lr['distance_km']} km, {lr['tss']} TSS)"
+                )
+
+    # Weekly TSS with dates and sport breakdown
+    from datetime import date as date_cls
+    from datetime import timedelta as td
+    def week_start(d_str: str) -> str:
+        d = date_cls.fromisoformat(d_str)
+        ws = d - td(days=d.weekday())
+        return ws.isoformat()
+
+    weekly = defaultdict(lambda: {"tss": 0.0, "sessions": 0, "sports": defaultdict(lambda: {"count": 0, "tss": 0.0})})
+    for w in completed:
+        d = _workout_date(w)
+        if not d:
+            continue
+        ws_key = week_start(d)
+        tss = _field_float(w, "tssActual", "tss_actual", "tss") or 0
+        sport = _detect_sport(w)
+        weekly[ws_key]["tss"] += tss
+        weekly[ws_key]["sessions"] += 1
+        weekly[ws_key]["sports"][sport]["count"] += 1
+        weekly[ws_key]["sports"][sport]["tss"] += tss
+
+    weekly_table = []
+    for ws_key in sorted(weekly.keys()):
+        v = weekly[ws_key]
+        we = (date_cls.fromisoformat(ws_key) + td(days=6)).isoformat()
+        sport_str = ", ".join(
+            f"{s}:{v2['count']}({v2['tss']:.0f})"
+            for s, v2 in sorted(v["sports"].items(), key=lambda x: -x[1]["tss"])
+        )
+        weekly_table.append({
+            "week_start": ws_key,
+            "week_end": we,
+            "week_label": f"{ws_key} to {we}",
+            "tss": round(v["tss"], 1),
+            "sessions": v["sessions"],
+            "sports": sport_str,
+        })
+
+    # RPE/feeling highlights from expanded workouts (compact)
+    # Include all RPE >= 7 (high effort — behavioral flag for easy sessions)
+    # and RPE <= 2 (very easy — good compliance signal)
+    rpe_highlights = []
+    for ew in expanded_workouts:
+        sf = ew.get("subjective_feedback")
+        if isinstance(sf, dict) and sf:
+            rpe = sf.get("rpe")
+            feeling = sf.get("feeling")
+            if rpe and (rpe >= 7 or rpe <= 2):
+                rpe_highlights.append({
+                    "date": ew.get("date"),
+                    "title": ew.get("title"),
+                    "sport": _detect_sport_from_expanded(ew),
+                    "rpe": rpe,
+                    "feeling": feeling,
+                })
+
+    # Pre-compute RPE≥7 summary so the LLM doesn't have to count.
+    # This prevents the recurring bug where the LLM reports "2 sessions"
+    # when there are actually 3 (typically omitting Bike entries).
+    rpe7_entries = [r for r in rpe_highlights if r.get("rpe", 0) >= 7]
+    rpe7_by_sport: dict[str, int] = defaultdict(int)
+    for r in rpe7_entries:
+        rpe7_by_sport[r.get("sport", "Unknown")] += 1
+    rpe7_summary = {
+        "total_count": len(rpe7_entries),
+        "by_sport": dict(rpe7_by_sport),
+        "dates": [r["date"] for r in rpe7_entries],
+        "coaching_note": (
+            f"There are {len(rpe7_entries)} sessions with RPE≥7 across "
+            f"{len(rpe7_by_sport)} sport(s): {', '.join(f'{k}: {v}' for k, v in sorted(rpe7_by_sport.items()))}. "
+            f"Report ALL of them — do not omit any sport. Dates: {', '.join(r['date'] for r in rpe7_entries)}."
+        ) if rpe7_entries else "No sessions with RPE≥7 in this period.",
+    }
+
+    # Key sessions (from expanded_workouts)
+    key_sessions = []
+    for ew in expanded_workouts:
+        reasons = ew.get("expansion_reasons", [])
+        if "key_session" in reasons:
+            key_sessions.append({
+                "date": ew.get("date"),
+                "title": ew.get("title"),
+                "id": ew.get("id"),
+            })
+
+    return {
+        "total_sessions": len(completed),
+        "session_frequency": {
+            "sessions": len(completed),
+            "period_days": period_days,
+            "period_weeks": round(period_days / 7, 2) if period_days else None,
+            "sessions_per_week": round(len(completed) / (period_days / 7), 1) if period_days else None,
+            "display": (
+                f"{len(completed)} sesiones en {period_days} días = "
+                f"{len(completed) / (period_days / 7):.1f}/sem"
+            ) if period_days else None,
+            "instruction": "Use sessions_per_week/display directly — do NOT recalculate session frequency manually.",
+        },
+        "total_tss": round(sum(_field_float(w, "tssActual", "tss_actual", "tss") or 0 for w in completed), 1),
+        "by_sport": sport_summary,
+        "long_run_progression": long_runs,
+        "long_run_max_duration_min": max_dur if long_runs else 0,
+        "long_run_max_date": long_runs[-1]["date"] if long_runs else "",
+        "milestones": milestones,
+        "weekly_tss": weekly_table,
+        "weekly_breakdown": weekly_table,  # alias for SKILL.md rule #42
+        "key_sessions": key_sessions,
+        "rpe_extremes": rpe_highlights,
+        "rpe7_summary": rpe7_summary,
+        "instruction": (
+            "Use this workout_summary for all workout narrative. "
+            "Long run progression, weekly TSS with dates, sport breakdown, milestones, "
+            "and session_frequency are pre-computed — do NOT re-derive from raw workouts or expanded_workouts. "
+            "Use session_frequency.display for sessions/week; do NOT calculate it manually. "
+            "If you need RPE/feeling/comments for a specific session, look up by id in expanded_workouts. "
+            "RPE≥7 count is pre-computed in rpe7_summary — use that count, do NOT count manually."
+        ),
+    }
+
+
+def _compact_metrics(metrics_result: Any) -> dict[str, Any]:
+    """Summarize Garmin health metrics into a compact structure.
+
+    The raw metrics response can be 128K+ chars (73 days × multiple metrics
+    × detail arrays). This function computes averages, ranges, and latest
+    values for HRV, sleep, pulse/RHR, Body Battery, and stress — everything
+    the LLM needs for readiness narrative in ~1K chars.
+    """
+    if not isinstance(metrics_result, dict):
+        return {"isError": True, "message": "metrics result is not a dict"}
+
+    metrics = metrics_result.get("metrics", [])
+    if not metrics:
+        return {"available": False, "reason": "no metrics returned"}
+
+    # Extract latest values and compute averages for key signals
+    from collections import defaultdict
+    signal_values = defaultdict(list)
+    latest_metric = {}
+    latest_date = ""
+
+    for m in metrics:
+        if not isinstance(m, dict):
+            continue
+        d = _metric_date(m)
+        if d and d > latest_date:
+            latest_date = d
+            latest_metric = _latest_metric_dict({"metrics": [m]})
+
+        details = m.get("details", [])
+        if isinstance(details, list):
+            for detail in details:
+                label = (detail.get("label") or detail.get("name") or "").lower().replace(" ", "_")
+                value = detail.get("value")
+                if value is not None:
+                    signal_values[label].append(value)
+
+    def avg(key: str) -> float | None:
+        vals = signal_values.get(key, [])
+        if not vals:
+            # Try key with suffix (e.g. "sleep" → "sleep_hours", "stress" → "stress_level")
+            for full_key in signal_values:
+                if full_key.startswith(key):
+                    vals = signal_values[full_key]
+                    break
+        if not vals:
+            return None
+        # Handle array values (e.g. Stress Level = [min, max, avg])
+        # Use the avg (last element) for averaging
+        scalar_vals = []
+        for v in vals:
+            if isinstance(v, list) and len(v) >= 3:
+                scalar_vals.append(v[-1])  # avg is last element
+            elif isinstance(v, (int, float)):
+                scalar_vals.append(v)
+        if not scalar_vals:
+            return None
+        return round(sum(scalar_vals) / len(scalar_vals), 1)
+
+    def latest(key: str) -> float | None:
+        v = latest_metric.get(key)
+        if v is None:
+            # Try key with suffix (e.g. "sleep" → "sleep_hours", "stress" → "stress_level")
+            for full_key in latest_metric:
+                if full_key.startswith(key) and full_key != key:
+                    v = latest_metric[full_key]
+                    break
+        if v is not None:
+            # Handle array values (e.g. Stress Level = [min, max, avg])
+            if isinstance(v, list) and len(v) >= 3:
+                return round(float(v[-1]), 1)  # avg is last element
+            try:
+                return round(float(v), 1)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    # Body Battery from latest metric
+    bb = _body_battery_interpretation(latest_metric)
+
+    # Stress Level interpretation (array format: [min, max, avg])
+    stress_raw = latest_metric.get("stress_level")
+    stress_detail = None
+    if isinstance(stress_raw, list) and len(stress_raw) >= 3:
+        stress_detail = {
+            "raw": stress_raw,
+            "format": "array_min_max_avg",
+            "min": stress_raw[0],
+            "max": stress_raw[1],
+            "avg": stress_raw[2],
+            "display": f"Stress: avg {stress_raw[2]} (max {stress_raw[1]})",
+        }
+
+    # Pre-formatted readiness snapshot — a concise string with all 5 signals.
+    # The LLM can use it verbatim, partially, or as a quick reference.
+    # This is a FORMATTED FACT, not a prescription — the LLM decides which
+    # signals are relevant per question type.
+    hrv_l = latest("hrv")
+    hrv_a = avg("hrv")
+    sleep_l = latest("sleep")
+    sleep_a = avg("sleep")
+    rhr_l = latest("pulse")
+    rhr_a = avg("pulse")
+    bb_display = bb.get("display_guidance", "") if bb else ""
+    stress_display = stress_detail.get("display", "") if stress_detail else ""
+
+    readiness_parts = []
+    if hrv_l is not None:
+        readiness_parts.append(f"HRV {hrv_l} (avg {hrv_a})")
+    if sleep_l is not None:
+        readiness_parts.append(f"Sueño {sleep_l}h (avg {sleep_a}h)")
+    if rhr_l is not None:
+        readiness_parts.append(f"RHR {rhr_l} bpm (avg {rhr_a})")
+    if bb_display:
+        readiness_parts.append(bb_display)
+    if stress_display:
+        readiness_parts.append(stress_display)
+    readiness_snapshot = " | ".join(readiness_parts) if readiness_parts else "No readiness metrics available"
+
+    return {
+        "available": True,
+        "latest_date": latest_date,
+        "latest": {
+            "hrv": hrv_l,
+            "sleep_hours": sleep_l,
+            "pulse_rhr": rhr_l,
+            "body_battery": bb.get("wake_value") if bb else None,
+            "stress": latest("stress"),
+        },
+        "averages": {
+            "hrv": hrv_a,
+            "sleep_hours": sleep_a,
+            "pulse_rhr": rhr_a,
+            "stress": avg("stress"),
+        },
+        "data_points": len(metrics),
+        "body_battery_detail": bb,
+        "stress_detail": stress_detail,
+        "readiness_snapshot": readiness_snapshot,
+        "instruction": (
+            "Use metrics_compact for readiness narrative. "
+            "Latest values are from the most recent metric date. "
+            "Averages cover the full period. For day-by-day detail, use the 'metrics' field. "
+            "Available readiness signals: (1) HRV (latest + average), "
+            "(2) sleep_hours (latest + average), "
+            "(3) pulse_rhr / RHR (latest + average), "
+            "(4) body_battery — use body_battery_detail.display_guidance for the full format (wake value + min + avg), "
+            "(5) stress — use stress_detail.display if available (includes avg + max). "
+            "Choose which signals are relevant per the question type — a post-workout analysis "
+            "of a strength session may not need stress level, while a global analysis should "
+            "include all 5. Use your judgment, not a rigid checklist."
+        ),
+    }
+
+
+def _compact_fitness(fitness_result: Any) -> dict[str, Any]:
+    """Summarize the narrow-period fitness data (CTL/ATL/TSB daily arrays).
+
+    The raw fitness response includes daily_data with 73+ entries (~5.5K).
+    This function keeps only current values, 7-day rolling averages, and
+    a compact weekly summary — enough for the LLM to narrate trends
+    without 5K of daily arrays.
+    """
+    if not isinstance(fitness_result, dict):
+        return {"isError": True, "message": "fitness result is not a dict"}
+
+    current = fitness_result.get("current", {})
+    daily = fitness_result.get("daily_data", [])
+
+    if not daily:
+        return {
+            "current": current,
+            "available": False,
+        }
+
+    # Weekly CTL/ATL/TSB summary from daily_data
+    from collections import defaultdict
+    from datetime import date as date_cls
+    from datetime import timedelta as td
+
+    weekly = defaultdict(lambda: {"ctl": [], "atl": [], "tsb": [], "tss": []})
+    for entry in daily:
+        d = entry.get("date", "")
+        if not d:
+            continue
+        try:
+            dt = date_cls.fromisoformat(d)
+        except (ValueError, TypeError):
+            continue
+        ws = (dt - td(days=dt.weekday())).isoformat()
+        weekly[ws]["ctl"].append(entry.get("ctl", 0))
+        weekly[ws]["atl"].append(entry.get("atl", 0))
+        weekly[ws]["tsb"].append(entry.get("tsb", 0))
+        weekly[ws]["tss"].append(entry.get("tss", 0))
+
+    weekly_summary = []
+    for ws in sorted(weekly.keys()):
+        v = weekly[ws]
+        weekly_summary.append({
+            "week_start": ws,
+            "ctl_avg": round(sum(v["ctl"]) / max(len(v["ctl"]), 1), 1),
+            "atl_avg": round(sum(v["atl"]) / max(len(v["atl"]), 1), 1),
+            "tsb_avg": round(sum(v["tsb"]) / max(len(v["tsb"]), 1), 1),
+            "tss_total": round(sum(v["tss"]), 1),
+        })
+
+    return {
+        "current": current,
+        "weekly_summary": weekly_summary,
+        "data_points": len(daily),
+        "instruction": (
+            "Use fitness_compact for current CTL/ATL/TSB and weekly trends. "
+            "For daily detail, call tp_get_fitness directly."
+        ),
+    }
+
+
+async def _compute_fitness_historical() -> dict[str, Any]:
+    """Fetch full fitness history from 2024-01-01 to today and compute key milestones.
+
+    This ensures the LLM always has the real historical peak CTL, nadir, and
+    monthly averages available — regardless of what date range it passed to
+    tp_coach_period_review_context. The LLM cannot under-query or hallucinate
+    a peak value because the code injects the ground truth.
+    """
+    hist_start = "2024-01-01"
+    hist_end = date.today().isoformat()
+    hist_days = (date.today() - date.fromisoformat(hist_start)).days
+
+    # FitnessInput caps days at 365, but when using start_date/end_date
+    # the days field is ignored — the API accepts arbitrary ranges via the
+    # performedata endpoint.
+    try:
+        result = await tp_get_fitness(
+            start_date=hist_start,
+            end_date=hist_end,
+        )
+    except Exception as exc:
+        return {"isError": True, "message": f"fitness_historical query failed: {exc}"}
+
+    if isinstance(result, dict) and result.get("isError"):
+        return result
+
+    daily = result.get("daily_data", [])
+    if not daily:
+        return {"isError": True, "message": "No daily fitness data returned for historical range."}
+
+    # Compute peak CTL and its date
+    peak_ctl = 0.0
+    peak_date = ""
+    for entry in daily:
+        ctl = entry.get("ctl", 0)
+        if ctl > peak_ctl:
+            peak_ctl = ctl
+            peak_date = entry.get("date", "")
+
+    # Compute nadir (minimum CTL after the peak)
+    nadir_ctl = peak_ctl
+    nadir_date = ""
+    found_peak = False
+    for entry in daily:
+        d = entry.get("date", "")
+        ctl = entry.get("ctl", 0)
+        if d == peak_date:
+            found_peak = True
+        if found_peak and ctl < nadir_ctl:
+            nadir_ctl = ctl
+            nadir_date = d
+
+    # Current values (last entry)
+    current = daily[-1] if daily else {}
+    current_ctl = current.get("ctl", 0)
+    pct_of_peak = round(current_ctl / peak_ctl * 100, 1) if peak_ctl > 0 else 0
+
+    # Monthly averages
+    monthly: dict[str, dict[str, float]] = {}
+    for entry in daily:
+        d = entry.get("date", "")
+        if not d:
+            continue
+        month = d[:7]
+        if month not in monthly:
+            monthly[month] = {"ctl_sum": 0.0, "count": 0, "ctl_max": 0.0}
+        ctl = entry.get("ctl", 0)
+        monthly[month]["ctl_sum"] += ctl
+        monthly[month]["count"] += 1
+        if ctl > monthly[month]["ctl_max"]:
+            monthly[month]["ctl_max"] = ctl
+
+    monthly_summary = {}
+    for month in sorted(monthly.keys()):
+        v = monthly[month]
+        monthly_summary[month] = {
+            "avg_ctl": round(v["ctl_sum"] / v["count"], 1) if v["count"] else 0,
+            "max_ctl": round(v["ctl_max"], 1),
+            "days": v["count"],
+        }
+
+    # Top 5 CTL peaks with dates
+    sorted_by_ctl = sorted(daily, key=lambda x: x.get("ctl", 0), reverse=True)
+    top5 = [
+        {
+            "date": e.get("date", ""),
+            "ctl": e.get("ctl", 0),
+            "atl": e.get("atl", 0),
+            "tsb": e.get("tsb", 0),
+        }
+        for e in sorted_by_ctl[:5]
+    ]
+
+    return {
+        "period": {"start": hist_start, "end": hist_end, "days": hist_days},
+        "peak_ctl": round(peak_ctl, 1),
+        "peak_date": peak_date,
+        "nadir_after_peak": round(nadir_ctl, 1),
+        "nadir_date": nadir_date,
+        "current_ctl": round(current_ctl, 1),
+        "pct_of_peak": pct_of_peak,
+        "top_5_ctl_peaks": top5,
+        "monthly_avg_ctl": monthly_summary,
+        "total_data_points": len(daily),
+        "coaching_instruction": (
+            f"REAL HISTORICAL PEAK: CTL {round(peak_ctl, 1)} on {peak_date}. "
+            f"Current CTL {round(current_ctl, 1)} = {pct_of_peak}% of peak. "
+            f"NADIR after peak: CTL {round(nadir_ctl, 1)} on {nadir_date} — this is the lowest point after the peak, "
+            f"quantifying the full extent of the detraining/stop period. "
+            f"The trajectory from {round(peak_ctl, 1)} → {round(nadir_ctl, 1)} "
+            f"→ {round(current_ctl, 1)} tells the complete story. "
+            f"Use these values — do NOT guess, hallucinate, or cite any other peak value. "
+            f"The {round(peak_ctl, 1)} comes from TrainingPeaks performedata API (2024-01-01 to today). "
+            f"If any other source says a different peak, THIS value is the ground truth."
+        ),
+    }
+
+
+def _build_coaching_assessment(
+    *,
+    workout_summary: dict[str, Any],
+    missed_summary: dict[str, Any],
+    metrics_compact: dict[str, Any],
+    fitness_compact: dict[str, Any],
+    fitness_historical: dict[str, Any] | None,
+    expanded_workouts: list[dict[str, Any]],
+    period_days: int,
+) -> dict[str, Any]:
+    """Provide derived FACTS that the LLM would otherwise compute unreliably.
+
+    Design principle: CODE provides facts (what IS), LLM provides judgment
+    (what it MEANS and what to DO). This function computes arithmetic and
+    lookups that LLMs get wrong (counting, date math, 30d windows) but does
+    NOT make coaching decisions, diagnoses, or recommendations.
+
+    What stays in code (LLMs bad at):
+    - Counting RPE≥7 sessions by sport
+    - 30-day max long run duration (date math)
+    - Weekly run frequency counting
+    - HRV deviation from average (arithmetic)
+    - Cycle position from JSON timeline (date math)
+    - Spurious session filtering (data quality)
+
+    What stays in LLM (code bad at):
+    - Interpreting what an RPE 7 + Feeling "Fuerte" means in context
+    - Deciding whether to PROGRESS or MAINTAIN (weighing criteria)
+    - Applying the 10% rule with judgment (deload context, conditions)
+    - Deciding whether to follow or modify the 3:1 plan
+    - Choosing which readiness signals are relevant per question type
+    """
+    import json as _json
+    from datetime import date as date_cls
+    from datetime import timedelta as td
+
+    today = date_cls.today()
+    ws = workout_summary
+
+    # ── B: RPE≥7 sessions with Feeling context (FACTS, not diagnosis) ────
+    # Provide the raw RPE + Feeling pairing so the LLM can interpret with
+    # full context (heat, day variance, recovery status, etc.)
+    rpe7_sessions = []
+    for entry in ws.get("rpe_extremes", []):
+        rpe = entry.get("rpe", 0)
+        if rpe < 7:
+            continue
+        feeling = entry.get("feeling", {}) or {}
+        rpe7_sessions.append({
+            "date": entry.get("date"),
+            "sport": entry.get("sport", "Unknown"),
+            "rpe": rpe,
+            "feeling_label": feeling.get("label", "Unknown"),
+            "feeling_score_1_to_5": feeling.get("score_1_to_5", 0),
+            "feeling_tp_code": feeling.get("code", None),
+        })
+    # Carryover: RPE≥7 within last 14 days (date math, not interpretation)
+    recent_14d = today - td(days=14)
+    carryover_14d = [
+        s for s in rpe7_sessions
+        if s["date"] and date_cls.fromisoformat(s["date"]) >= recent_14d
+    ]
+
+    # ── C: Long run 30-day max (FACT, not prescription) ──────────────────
+    # The 10% rule is a guideline the LLM applies with context.
+    # Code provides the 30d max; LLM decides what to do with it.
+    long_runs = ws.get("long_run_progression", [])
+    long_run_max = ws.get("long_run_max_duration_min", 0)
+    long_run_max_date = ws.get("long_run_max_date", "")
+    recent_30d = today - td(days=30)
+    recent_long_runs = [
+        lr for lr in long_runs
+        if lr.get("date") and date_cls.fromisoformat(lr["date"]) >= recent_30d
+    ]
+    max_30d = max((lr.get("duration_min", 0) for lr in recent_long_runs), default=0)
+    max_30d_date = max(
+        (lr for lr in recent_long_runs if lr.get("duration_min", 0) == max_30d),
+        key=lambda lr: lr.get("date", ""),
+        default={},
+    ).get("date", "")
+
+    # ── D: Progression readiness inputs (VALUES, not pass/fail) ──────────
+    # Provide raw values for each criterion. The LLM weighs them in context.
+    weekly = ws.get("weekly_breakdown", [])
+
+    # (1) Count weeks with 3+ runs
+    weeks_with_3plus_runs = 0
+    for w in weekly:
+        sports_str = w.get("sports", "")
+        run_count = 0
+        for part in sports_str.split(", "):
+            if part.startswith("Run:"):
+                with suppress(ValueError, IndexError):
+                    run_count = int(part.split(":")[1].split("(")[0])
+        if run_count >= 3:
+            weeks_with_3plus_runs += 1
+
+    # (2) Pain signals from comments (raw flag, not diagnosis)
+    # Detect pain-related keywords but exclude negations (sin dolor, no dolor, etc.)
+    pain_signals = 0
+    pain_keywords = ("dolor", "molestia", "lesión", "lesion", "adolorido", "pinche", "ardor")
+    negation_patterns = (
+        "sin dolor",
+        "no dolor",
+        "sin molestia",
+        "no molestia",
+        "sin lesión",
+        "no lesión",
+        "sin lesion",
+    )
+    for ew in expanded_workouts:
+        comment = ""
+        detail = ew.get("detail")
+        if isinstance(detail, dict):
+            raw_comments = detail.get("workout_comments", "")
+            if isinstance(raw_comments, list):
+                comment = " ".join(str(c) for c in raw_comments)
+            elif isinstance(raw_comments, str):
+                comment = raw_comments
+        comment_lower = comment.lower()
+        # Check for pain keywords but exclude negated mentions
+        has_pain = False
+        for kw in pain_keywords:
+            if kw in comment_lower:
+                # Check if this mention is negated
+                is_negated = False
+                for neg in negation_patterns:
+                    if neg not in comment_lower:
+                        continue
+                    start_idx = comment_lower.index(neg)
+                    end_idx = start_idx + len(neg) + len(kw) + 5
+                    if kw in comment_lower[start_idx:end_idx]:
+                        is_negated = True
+                        break
+                if not is_negated:
+                    has_pain = True
+                    break
+        if has_pain:
+            pain_signals += 1
+
+    # (3) HRV deviation (arithmetic)
+    mc = metrics_compact or {}
+    hrv_latest = (mc.get("latest", {}) or {}).get("hrv")
+    hrv_avg = (mc.get("averages", {}) or {}).get("hrv")
+    hrv_deviation_pct = None
+    if hrv_latest and hrv_avg and hrv_avg > 0:
+        hrv_deviation_pct = round(abs(hrv_latest - hrv_avg) / hrv_avg * 100, 1)
+
+    # (4) Strength frequency (arithmetic)
+    by_sport = ws.get("by_sport", {})
+    strength_sessions = by_sport.get("Strength", {}).get("sessions", 0)
+    weeks_count = max(len(weekly), 1)
+    strength_per_week = round(strength_sessions / weeks_count, 1)
+
+    progression_inputs = {
+        "weeks_with_3plus_runs": weeks_with_3plus_runs,
+        "pain_mentions_in_comments": pain_signals,
+        "pain_mentions_note": (
+            "Count of workout comments containing pain-related keywords (dolor, molestia, lesión, etc.) "
+            "excluding negations (sin dolor, no dolor). These are MENTIONS, not diagnosed pain events — "
+            "review the comments in context to determine if any represent increasing pain that should "
+            "block progression."
+        ),
+        "long_run_max_min": long_run_max,
+        "rpe7_in_last_14d": len(carryover_14d),
+        "hrv_latest": hrv_latest,
+        "hrv_avg": hrv_avg,
+        "hrv_deviation_pct": hrv_deviation_pct,
+        "strength_per_week": strength_per_week,
+        "note": (
+            "These are raw inputs for progression judgment. Weigh them in context — availability, upcoming "
+            "test, life stress, subjective report. The 3:1 checkpoint table in SKILL.md rule #27 is the "
+            "decision framework, not a binary counter."
+        ),
+    }
+
+    # ── E: Cycle 3:1 PLANNED status from JSON (context, not prescription) ─
+    _block_plan_path = "/media/SSD-Storage-1/hermes-data/profiles/coach/coach-data/CURRENT_BLOCK_PLAN.json"
+    cycle_status: dict[str, Any] = {}
+    try:
+        with open(_block_plan_path) as _f:
+            bp = _json.load(_f)
+        cycle_start = date_cls.fromisoformat(bp["cycle_start_date"])
+        cycle_weeks = bp.get("cycle_weeks", 4)
+        phases = bp.get("phases", ["Carga 1", "Carga 2", "Carga 3", "Descarga"])
+        cycles_def = bp.get("cycles", [])
+
+        if today < cycle_start:
+            cycle_status = {"planned_status": "before_start", "note": f"Cycle starts {bp['cycle_start_date']}"}
+        else:
+            current_cycle = None
+            week_in_cycle = 0
+            for cyc in cycles_def:
+                cyc_start = date_cls.fromisoformat(cyc["start_date"])
+                cyc_end = date_cls.fromisoformat(cyc["end_date"])
+                if cyc_start <= today <= cyc_end:
+                    current_cycle = cyc
+                    week_in_cycle = (today - cyc_start).days // 7
+                    break
+
+            if current_cycle:
+                idx = min(week_in_cycle, cycle_weeks - 1)
+                cycle_num = current_cycle["number"]
+                phase = phases[idx] if idx < len(phases) else f"Week {idx+1}"
+                test_info = None
+                for w in current_cycle.get("weeks", []):
+                    if w.get("test_cp_ftp"):
+                        test_info = f"{w['dates']} ({w.get('notes', 'test')})"
+                        break
+                if not test_info and current_cycle.get("test_cp_ftp_scheduled"):
+                    test_info = current_cycle["test_cp_ftp_scheduled"]
+
+                # Also search future cycles for the next scheduled test
+                if not test_info:
+                    for cyc in cycles_def:
+                        if cyc["number"] <= cycle_num:
+                            continue
+                        for w in cyc.get("weeks", []):
+                            if w.get("test_cp_ftp"):
+                                test_info = f"{w['dates']} ({w.get('notes', 'test')}) — Ciclo {cyc['number']}"
+                                break
+                        if test_info:
+                            break
+                        if cyc.get("test_cp_ftp_scheduled"):
+                            test_info = cyc["test_cp_ftp_scheduled"]
+                            break
+
+                # weeks_to_deload: number of weeks REMAINING until deload starts,
+                # NOT counting the current week. E.g. if in week 1 of a 3:1 (4-week)
+                # cycle, there are 2 more carga weeks + 1 deload = 3 weeks to deload.
+                weeks_to_deload = max(cycle_weeks - idx - 1, 0)
+                cycle_status = {
+                    "planned_cycle": cycle_num,
+                    "planned_week": idx + 1,
+                    "planned_phase": phase,
+                    "weeks_to_deload": weeks_to_deload,
+                    "next_planned_phase": (
+                        phases[(idx + 1) % cycle_weeks]
+                        if idx < cycle_weeks - 1
+                        else f"Ciclo {cycle_num + 1} — {phases[0]}"
+                    ),
+                    "test_cp_ftp_scheduled": test_info,
+                    "is_plan": True,
+                    "note": (
+                        "This is the PLANNED cycle position from CURRENT_BLOCK_PLAN.json. You can deviate "
+                        "if data justifies it — sickness, unexpected fatigue, ahead-of-schedule adaptation, "
+                        "or life events may require treating a carga week as consolidation, or skipping a "
+                        "deload. Use the 3:1 checkpoint table (SKILL.md rule #27) to decide."
+                    ),
+                }
+            elif cycles_def:
+                # Beyond defined cycles — extrapolate
+                last_cycle = cycles_def[-1]
+                last_start = date_cls.fromisoformat(last_cycle["start_date"])
+                total_weeks = (today - last_start).days // 7
+                cycle_num = last_cycle["number"] + total_weeks // cycle_weeks
+                idx = total_weeks % cycle_weeks
+                phase = phases[idx] if idx < len(phases) else f"Week {idx+1}"
+                weeks_to_deload = max(cycle_weeks - idx - 1, 0)
+                cycle_status = {
+                    "planned_cycle": cycle_num,
+                    "planned_week": idx + 1,
+                    "planned_phase": phase,
+                    "weeks_to_deload": weeks_to_deload,
+                    "next_planned_phase": (
+                        phases[(idx + 1) % cycle_weeks]
+                        if idx < cycle_weeks - 1
+                        else f"Ciclo {cycle_num + 1} — {phases[0]}"
+                    ),
+                    "is_plan": True,
+                    "note": (
+                        f"Extrapolated beyond defined cycles (last defined: cycle {last_cycle['number']}). "
+                        "Update CURRENT_BLOCK_PLAN.json when the next cycle is confirmed."
+                    ),
+                }
+            else:
+                cycle_status = {"planned_status": "no_cycles_defined"}
+
+            # Include bridge plan as context
+            bridge = bp.get("bridge_plan", [])
+            if bridge:
+                cycle_status["bridge_plan"] = bridge
+
+            # Include historical trajectory
+            hist = bp.get("historical_context", {})
+            if hist and fitness_historical:
+                cycle_status["historical_trajectory"] = (
+                    f"Peak CTL {hist.get('peak_ctl')} ({hist.get('peak_date')}) → "
+                    f"nadir {hist.get('nadir_ctl')} ({hist.get('nadir_date')}) → "
+                    f"current {fitness_historical.get('current_ctl', '?')}"
+                )
+
+    except (FileNotFoundError, KeyError, ValueError, _json.JSONDecodeError):
+        cycle_status = {
+            "planned_status": "block_plan_json_not_found",
+            "note": (
+                "Read CURRENT_BLOCK_PLAN.md manually at "
+                "/media/SSD-Storage-1/hermes-data/profiles/coach/coach-data/CURRENT_BLOCK_PLAN.md"
+            ),
+        }
+
+    # ── Global review facts: pre-formatted FACTS for block/global narratives ─
+    # These are not recommendations. They prevent recurring omissions in global
+    # reviews (stress, nadir, pain mentions, RPE+Feeling context, bridge/Pw:Hr).
+    rpe7_line = "No RPE≥7 sessions in this period."
+    if rpe7_sessions:
+        rpe7_line = "; ".join(
+            f"{s.get('date')} {s.get('sport')} RPE {s.get('rpe')} / Feeling {s.get('feeling_label')}"
+            for s in rpe7_sessions
+        )
+
+    readiness_line = metrics_compact.get("readiness_snapshot") if isinstance(metrics_compact, dict) else None
+
+    historical_line = None
+    if isinstance(fitness_historical, dict) and not fitness_historical.get("isError"):
+        peak = fitness_historical.get("peak_ctl")
+        peak_date = fitness_historical.get("peak_date")
+        nadir = fitness_historical.get("nadir_after_peak")
+        nadir_date = fitness_historical.get("nadir_date")
+        current = fitness_historical.get("current_ctl")
+        pct = fitness_historical.get("pct_of_peak")
+        historical_line = (
+            f"CTL trajectory: peak {peak} ({peak_date}) → nadir {nadir} ({nadir_date}) "
+            f"→ current {current} ({pct}% of peak)."
+        )
+
+    bridge_plan = cycle_status.get("bridge_plan", []) if isinstance(cycle_status, dict) else []
+    bridge_plan_table = [
+        {
+            "phase": item.get("phase"),
+            "criteria": item.get("criteria"),
+            "target_date": item.get("target_date"),
+        }
+        for item in bridge_plan
+        if isinstance(item, dict)
+    ]
+
+    pw_hr_status = {
+        "available_in_period_review_context": False,
+        "status": "pending_verification",
+        "display": (
+            "Pw:Hr/decoupling is a bridge-plan criterion but is not computed in "
+            "tp_coach_period_review_context; treat it as pending verification before "
+            "declaring full Rebuild → Build readiness."
+        ),
+    }
+
+    pain_mentions_line = (
+        f"Pain-related comments: {pain_signals} non-negated mention(s). "
+        "These are mentions, not diagnosed pain events; review context and trend before using as a blocker."
+    )
+
+    bridge_markdown = "\n".join(
+        f"| {item.get('phase')} | {item.get('criteria')} | {item.get('target_date')} |"
+        for item in bridge_plan_table
+    ) or "| N/A | Bridge plan not available | N/A |"
+
+    mandatory_block = (
+        "## Global review facts to include\n"
+        f"- **Readiness completo:** {readiness_line or 'no disponible'}\n"
+        f"- **Trayectoria CTL:** {historical_line or 'no disponible'}\n"
+        f"- **Dolor/molestias:** {pain_mentions_line}\n"
+        f"- **RPE≥7 + Feeling:** {rpe7_line}\n"
+        f"- **Pw:Hr/decoupling:** {pw_hr_status['display']}\n"
+        "\n| Fase bridge | Criterios | Fecha objetivo |\n"
+        "|---|---|---|\n"
+        f"{bridge_markdown}\n"
+    )
+
+    global_review_facts = {
+        "purpose": "Ready-to-use FACTS for global/process/block review narratives; LLM still applies judgment.",
+        "mandatory_global_review_block_markdown": mandatory_block,
+        "must_include_when_available": [
+            "readiness_line_all_5_signals",
+            "historical_trajectory_peak_nadir_current",
+            "pain_mentions_line",
+            "rpe7_with_feeling_line",
+            "bridge_plan_table_or_summary",
+            "pw_hr_status_pending_if_not_computed",
+        ],
+        "readiness_line_all_5_signals": readiness_line,
+        "historical_trajectory_peak_nadir_current": historical_line,
+        "pain_mentions_line": pain_mentions_line,
+        "rpe7_with_feeling_line": rpe7_line,
+        "bridge_plan_table": bridge_plan_table,
+        "pw_hr_status": pw_hr_status,
+        "instruction": (
+            "For global/process/block reviews, include these facts explicitly if present. "
+            "Do not convert them into automatic recommendations: use them as evidence for judgment."
+        ),
+    }
+
+    # ── Assemble ─────────────────────────────────────────────────────────
+    return {
+        "rpe7_sessions": rpe7_sessions,
+        "rpe7_carryover_14d": carryover_14d,
+        "long_run_30d_max_min": max_30d,
+        "long_run_30d_max_date": max_30d_date,
+        "long_run_block_max_min": long_run_max,
+        "long_run_block_max_date": long_run_max_date,
+        "progression_inputs": progression_inputs,
+        "cycle_plan_status": cycle_status,
+        "global_review_facts": global_review_facts,
+        "instruction": (
+            "This field provides derived FACTS (counts, date math, 30d windows, "
+            "HRV deviation, cycle position from JSON). Use these facts as inputs "
+            "for your coaching judgment — do NOT treat them as prescriptions. "
+            "You remain the decision-maker for: interpreting RPE+Feeling in context, "
+            "weighing progression criteria, applying the 10% rule with judgment, "
+            "and deciding whether to follow or modify the 3:1 plan."
+        ),
+    }
+
+
 async def tp_coach_period_review_context(
     start_date: str,
     end_date: str,
@@ -505,6 +1571,12 @@ async def tp_coach_period_review_context(
     composite expands missed, key, and anomalous workouts before returning so
     weekly/monthly reports can cite comments/RPE/Feeling/private notes instead of
     guessing.
+
+    When review_type is 'block' or 'global' (or the requested period exceeds 30
+    days), a full historical fitness query from 2024-01-01 to today is
+    automatically included as ``fitness_historical``. This ensures the LLM always
+    has the real CTL peak and trajectory available without needing to make a
+    separate tp_get_fitness call with a wide date range.
     """
     try:
         start = SingleDateInput(date=start_date).date
@@ -517,6 +1589,11 @@ async def tp_coach_period_review_context(
 
     start_s, end_s = start.isoformat(), end.isoformat()
     days = (end - start).days + 1
+
+    # Determine whether to auto-inject full historical fitness context.
+    # This prevents the LLM from under-querying and hallucinating peak CTL values.
+    needs_historical = review_type.lower() in ("block", "global") or days > 30
+
     tasks = {
         "workouts": tp_get_workouts(start_s, end_s),
         "fitness": tp_get_fitness(days=days, start_date=start_s, end_date=end_s),
@@ -525,6 +1602,11 @@ async def tp_coach_period_review_context(
         "notes": tp_list_notes(start_s, end_s),
         "availability": tp_get_availability(start_s, end_s),
     }
+
+    # Run the standard tasks plus the historical fitness query in parallel.
+    if needs_historical:
+        tasks["fitness_historical"] = _compute_fitness_historical()
+
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     data = dict(zip(tasks.keys(), results, strict=True))
     missing: list[str] = []
@@ -582,16 +1664,106 @@ async def tp_coach_period_review_context(
             item["subjective_feedback"] = normalize_subjective_feedback(detail) if isinstance(detail, dict) else None
         expanded_workouts.append(item)
 
+    # Extract fitness_historical if it was queried (may not be present for short reviews)
+    fitness_historical = data.get("fitness_historical")
+    if isinstance(fitness_historical, Exception):
+        fitness_historical = {"isError": True, "message": str(fitness_historical)}
+        missing.append("fitness_historical")
+
+    # ── Compact summary layer ──────────────────────────────────────────────
+    # The raw expanded_workouts list can be 147K+ chars, metrics 128K+, and
+    # raw workouts 58K+. The gateway truncates tool responses at ~50K, so the
+    # compact summaries at the top get cut off before the LLM sees them.
+    # Solution: return ONLY compact summaries by default. The raw data stays
+    # available via individual tools (tp_get_workout, tp_get_metrics) for
+    # drill-down. This follows the "summary + drill-down" pattern from MCP
+    # community best practices (GitHub #169224, Context Mode, arxiv:2511.22729).
+    workout_summary = _build_workout_summary(workouts, expanded_workouts, period_days=days)
+    metrics_compact = _compact_metrics(data.get("metrics"))
+
+    # Pre-compute missed sessions summary so the LLM doesn't have to count.
+    # This prevents the recurring bug where the header says "5 omitted" but
+    # the list has 6 items.
+    missed_items = [
+        ew for ew in expanded_workouts
+        if "planned_not_completed_or_missing_actuals" in ew.get("expansion_reasons", [])
+    ]
+    from collections import defaultdict as _dd
+    missed_by_cat: dict[str, int] = _dd(int)
+    missed_list = []
+    for ew in missed_items:
+        reason = ew.get("reason") or {}
+        cat = reason.get("category", "unknown") if isinstance(reason, dict) else "unknown"
+        missed_by_cat[cat] += 1
+        missed_list.append({
+            "date": ew.get("date"),
+            "title": ew.get("title"),
+            "category": cat,
+            "evidence": reason.get("evidence", "") if isinstance(reason, dict) else "",
+        })
+    missed_summary = {
+        "total_count": len(missed_items),
+        "by_category": dict(missed_by_cat),
+        "sessions": missed_list,
+        "coaching_note": (
+            f"There are {len(missed_items)} missed/planned-not-completed sessions. "
+            f"By category: {', '.join(f'{k}: {v}' for k, v in sorted(missed_by_cat.items()))}. "
+            f"Report the TOTAL count as {len(missed_items)} — do NOT count manually."
+        ) if missed_items else "No missed sessions in this period.",
+    }
+
+    # Build compact versions of notes and availability too
+    notes_compact = []
+    if isinstance(data.get("notes"), dict):
+        for note in (data.get("notes", {}).get("notes", []))[:10]:  # Last 10 notes
+            if isinstance(note, dict):
+                notes_compact.append({
+                    "date": note.get("date") or note.get("workoutDay", ""),
+                    "type": note.get("type", ""),
+                    "text": (note.get("note") or note.get("text") or "")[:200],
+                })
+
+    # ── Coaching assessment (pre-computed derived analysis) ─────────────
+    # This replaces rules #19, #26, #27, #33, #37, #41, #49 with code-computed
+    # values that the LLM reads directly instead of having to interpret.
+    coaching_assessment = _build_coaching_assessment(
+        workout_summary=workout_summary,
+        missed_summary=missed_summary,
+        metrics_compact=metrics_compact,
+        fitness_compact=_compact_fitness(data.get("fitness")),
+        fitness_historical=fitness_historical if isinstance(fitness_historical, dict) else None,
+        expanded_workouts=expanded_workouts,
+        period_days=days,
+    )
+
     return {
         "review_type": review_type,
         "period": {"start": start_s, "end": end_s, "days": days},
-        "workouts": data.get("workouts"),
-        "fitness": data.get("fitness"),
-        "metrics": data.get("metrics"),
+        # ── Mandatory global-review facts first (maximum LLM visibility) ──
+        "global_review_facts": coaching_assessment.get("global_review_facts"),
+        # ── Compact summaries (always visible to LLM, ~12K total) ──
+        "workout_summary": workout_summary,
+        "missed_summary": missed_summary,
+        "coaching_assessment": coaching_assessment,
+        "metrics_compact": metrics_compact,
+        "fitness_compact": _compact_fitness(data.get("fitness")),
+        "fitness_historical": fitness_historical,
         "settings_summary": data.get("settings_summary"),
-        "notes": data.get("notes"),
+        "notes_recent": notes_compact,
         "availability": data.get("availability"),
-        "expanded_workouts": expanded_workouts,
+        # ── Expanded workout highlights (compact: only key/missed sessions) ──
+        "expanded_workout_highlights": [
+            {
+                "id": ew.get("id"),
+                "date": ew.get("date"),
+                "title": ew.get("title"),
+                "expansion_reasons": ew.get("expansion_reasons"),
+                "subjective_feedback": ew.get("subjective_feedback"),
+                "reason": ew.get("reason"),
+            }
+            for ew in expanded_workouts
+        ],
+        # ── Guardrails ──
         "decision_guardrails": {
             "must_expand_notable_workouts_before_causal_claims": True,
             "notable_workout_policy": (
@@ -600,6 +1772,24 @@ async def tp_coach_period_review_context(
             ),
             "can_make_period_causal_claims": detail_expansion_ok,
             "must_not_compensate_missed_tss_automatically": True,
+            "must_use_fitness_historical_for_peak_ctl": bool(
+                fitness_historical
+                and not (isinstance(fitness_historical, dict) and fitness_historical.get("isError"))
+            ),
+            "fitness_historical_rule": (
+                "When fitness_historical is present and not an error, its peak_ctl, peak_date, "
+                "pct_of_peak, and coaching_instruction are the GROUND TRUTH for any historical "
+                "comparison. Do NOT cite any other CTL peak value from memory, prior sessions, "
+                "or the narrow-period fitness field. The fitness_historical values come from "
+                "a 2024-01-01 to today query and override all other sources."
+            ),
+            "workout_summary_rule": (
+                "The workout_summary field contains pre-computed highlights: long run progression, "
+                "weekly TSS with dates and sport breakdown, new maximums, and notable sessions. "
+                "USE workout_summary for narrative — do NOT re-derive from expanded_workout_highlights. "
+                "If you need full detail on a specific workout (laps, power data, comments), "
+                "call tp_get_workout with the id from expanded_workout_highlights."
+            ),
         },
         "verification": verification,
         "missing_or_error_sources": missing,
@@ -696,10 +1886,11 @@ async def tp_coach_readiness_snapshot(
             "and subjective check-in until current metrics arrive."
         ),
         "body_battery_rule": (
-            "If Body Battery is present as a range/timeline, show the range/average explicitly (e.g. "
-            "TP range 63→100, avg ~90) and frame it as recovery support, not permission to add load. "
-            "Distinguish sleep-start/pre-sleep, overnight recovery, and wake/end-of-sleep value; never treat "
-            "pre-sleep as the wake value unless the source timestamp confirms it."
+            "Body Battery max value IS the wake/end-of-sleep value by Garmin's design (Garmin official: "
+            "'Body Battery is fullest in the morning when you wake up'; TP syncs 'the highest and lowest "
+            "value for each day'). Report it as: '{max} al despertar (mínimo del día: {min}, promedio: {avg})'. "
+            "Use the wake value as the primary readiness number: >=80 strong recovery support, 50-79 moderate, "
+            "<50 low. Frame it as recovery support, not permission to add load."
         ),
         "load_language_rule": (
             "Use calibrated load language: TSB around -10 after a long run is expected functional fatigue, "
