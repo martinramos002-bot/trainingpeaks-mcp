@@ -1150,6 +1150,164 @@ async def _compute_fitness_historical() -> dict[str, Any]:
     }
 
 
+def _comment_text_from_expanded(expanded_workout: dict[str, Any]) -> str:
+    detail = expanded_workout.get("detail")
+    parts: list[str] = []
+    if isinstance(detail, dict):
+        for key in ("workout_comments", "athlete_comment", "comments", "new_comment", "description"):
+            value = detail.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("comment") or item.get("text") or ""))
+                    else:
+                        parts.append(str(item))
+            elif value:
+                parts.append(str(value))
+    for key in ("title", "date"):
+        value = expanded_workout.get(key)
+        if value:
+            parts.append(str(value))
+    return " ".join(parts).strip()
+
+
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    lower = text.lower()
+    return any(needle in lower for needle in needles)
+
+
+def _build_science_guardrails(
+    *,
+    workout_summary: dict[str, Any],
+    metrics_compact: dict[str, Any],
+    fitness_compact: dict[str, Any],
+    fitness_historical: dict[str, Any] | None,
+    expanded_workouts: list[dict[str, Any]],
+    period_days: int,
+    cycle_status: dict[str, Any],
+    pain_mentions: int,
+    pw_hr_status: dict[str, Any],
+    consistency_warnings: list[str],
+) -> dict[str, Any]:
+    """Evidence-based guardrails for elite-coach narratives.
+
+    This is deliberately descriptive: it flags domains and uncertainty, but does
+    not diagnose, prescribe, or decide progression.
+    """
+    comments = [_comment_text_from_expanded(ew) for ew in expanded_workouts]
+    heat_terms = ("calor", "heat", "humedad", "humidity", "bochorno")
+    fatigue_terms = ("fatiga", "fatigue", "cansancio", "agot", "sin energía", "sin energia")
+    fueling_terms = ("gel", "carbo", "cho", "fuel", "hidrat", "sodio", "electrol")
+    doms_terms = ("doms", "agujeta", "adolorido", "dolor muscular")
+    heat_mentions = sum(1 for text in comments if _contains_any(text, heat_terms))
+    fatigue_mentions = sum(1 for text in comments if _contains_any(text, fatigue_terms))
+    fueling_mentions = sum(1 for text in comments if _contains_any(text, fueling_terms))
+    doms_mentions = sum(1 for text in comments if _contains_any(text, doms_terms))
+
+    rpe7_summary = workout_summary.get("rpe7_summary", {}) if isinstance(workout_summary, dict) else {}
+    rpe7_count = int(rpe7_summary.get("total_count") or 0) if isinstance(rpe7_summary, dict) else 0
+    session_frequency = workout_summary.get("session_frequency", {}) if isinstance(workout_summary, dict) else {}
+    sessions_per_week = session_frequency.get("sessions_per_week") if isinstance(session_frequency, dict) else None
+    weekly_tss = workout_summary.get("weekly_tss", []) if isinstance(workout_summary, dict) else []
+    weekly_tss_values = [float(w.get("tss") or 0) for w in weekly_tss if isinstance(w, dict)]
+    monotony_proxy = None
+    if len(weekly_tss_values) >= 3:
+        avg_tss = sum(weekly_tss_values) / len(weekly_tss_values)
+        variance = sum((v - avg_tss) ** 2 for v in weekly_tss_values) / len(weekly_tss_values)
+        sd = variance ** 0.5
+        monotony_proxy = round(avg_tss / sd, 2) if sd > 0 else None
+
+    latest = metrics_compact.get("latest", {}) if isinstance(metrics_compact, dict) else {}
+    sleep_latest = latest.get("sleep_hours") if isinstance(latest, dict) else None
+
+    red_flags: list[str] = []
+    if fatigue_mentions >= 2:
+        red_flags.append("repeated_fatigue_language")
+    if isinstance(sleep_latest, (int, float)) and sleep_latest < 6:
+        red_flags.append("sleep_low_energy_availability_context_needed")
+    if rpe7_count >= 2 and fatigue_mentions >= 1:
+        red_flags.append("high_effort_plus_fatigue_context_needed")
+
+    uncertainty_drivers: list[str] = []
+    if not metrics_compact or metrics_compact.get("available") is False:
+        uncertainty_drivers.append("readiness_metrics_missing_or_unavailable")
+    if not fitness_historical or fitness_historical.get("isError"):
+        uncertainty_drivers.append("fitness_historical_missing")
+    if pw_hr_status.get("available_in_period_review_context") is False:
+        uncertainty_drivers.append("pw_hr_not_computed_in_period_context")
+    if consistency_warnings:
+        uncertainty_drivers.append("derived_fact_consistency_warnings")
+
+    if consistency_warnings:
+        confidence = "low_until_reconciled"
+    elif uncertainty_drivers:
+        confidence = "moderate"
+    else:
+        confidence = "high_for_observed_facts_not_prescription"
+
+    return {
+        "purpose": "Evidence-based coaching guardrails; CODE flags domains, LLM applies judgment.",
+        "pain_safety": {
+            "mentions": pain_mentions,
+            "doms_mentions": doms_mentions,
+            "rule": (
+                "Pain/DOMS are risk signals, not diagnoses. "
+                "Pain altering mechanics blocks progression until clarified."
+            ),
+            "avoid_language": "Do not claim injury risk percentages or diagnosis from comments alone.",
+        },
+        "heat_environment": {
+            "mentions": heat_mentions,
+            "fueling_or_hydration_mentions": fueling_mentions,
+            "rule": (
+                "Heat/humidity can raise HR/RPE at same power; "
+                "check conditions before changing fitness assumptions."
+            ),
+            "cali_priority": (
+                "For Cali, heat is a first-class execution modifier: "
+                "adjust caps/duration before judging fitness loss."
+            ),
+        },
+        "reds_energy_availability": {
+            "flags": red_flags,
+            "rule": (
+                "Screen for low energy availability patterns; do not prescribe aggressive weight loss "
+                "or deficit during high load."
+            ),
+            "escalation": (
+                "If persistent fatigue, recurrent pain/bone pain, illness, poor sleep or mood/libido "
+                "changes appear, recommend professional evaluation."
+            ),
+        },
+        "cp_quality": {
+            "next_test_window": cycle_status.get("test_cp_ftp_scheduled"),
+            "rule": (
+                "Treat CP/FTP as current but auditable; test only when heat, fatigue, pain "
+                "and sensor-quality blockers are absent."
+            ),
+            "current_thresholds_are_not_dogma": True,
+        },
+        "load_distribution": {
+            "sessions_per_week": sessions_per_week,
+            "rpe7_count": rpe7_count,
+            "weekly_tss_values": weekly_tss_values[-6:],
+            "monotony_proxy_from_weekly_tss": monotony_proxy,
+            "rule": "Use sRPE/TSS/weekly monotony descriptively; avoid ACWR-style causal injury claims.",
+        },
+        "uncertainty": {
+            "confidence": confidence,
+            "drivers": uncertainty_drivers,
+            "reporting_rule": "State decision confidence and what data would change the recommendation.",
+        },
+        "narrative_requirements": [
+            "Distinguish physiological readiness from session/microcycle decision.",
+            "Say what data is missing before making strong claims.",
+            "Use CTL/ATL/TSB as load model, not absolute physiology.",
+            "For pain, REDs, heat illness or medical concerns: coach conservatively and refer out when appropriate.",
+        ],
+    }
+
+
 def _build_coaching_assessment(
     *,
     workout_summary: dict[str, Any],
@@ -1562,6 +1720,19 @@ def _build_coaching_assessment(
         ),
     }
 
+    science_guardrails = _build_science_guardrails(
+        workout_summary=workout_summary,
+        metrics_compact=metrics_compact,
+        fitness_compact=fitness_compact,
+        fitness_historical=fitness_historical,
+        expanded_workouts=expanded_workouts,
+        period_days=period_days,
+        cycle_status=cycle_status,
+        pain_mentions=pain_signals,
+        pw_hr_status=pw_hr_status,
+        consistency_warnings=consistency_warnings,
+    )
+
     # ── Assemble ─────────────────────────────────────────────────────────
     return {
         "rpe7_sessions": rpe7_sessions,
@@ -1573,6 +1744,7 @@ def _build_coaching_assessment(
         "progression_inputs": progression_inputs,
         "cycle_plan_status": cycle_status,
         "global_review_facts": global_review_facts,
+        "science_guardrails": science_guardrails,
         "instruction": (
             "This field provides derived FACTS (counts, date math, 30d windows, "
             "HRV deviation, cycle position from JSON). Use these facts as inputs "

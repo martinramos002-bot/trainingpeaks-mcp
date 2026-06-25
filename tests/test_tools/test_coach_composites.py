@@ -363,6 +363,42 @@ def test_normalize_subjective_feedback_maps_code_7_as_debil_not_positive():
     assert result["feeling"]["warning"] == "feeling_scale_is_inverse_higher_is_worse"
 
 
+def test_science_guardrails_flag_heat_reds_uncertainty_without_diagnosis():
+    result = coach_composites._build_science_guardrails(
+        workout_summary={
+            "rpe7_summary": {"total_count": 2},
+            "session_frequency": {"sessions_per_week": 4.0},
+            "weekly_tss": [{"tss": 120}, {"tss": 180}, {"tss": 260}],
+        },
+        metrics_compact={
+            "available": True,
+            "latest": {"sleep_hours": 5.4, "stress": 42},
+            "averages": {"sleep_hours": 7.0},
+        },
+        fitness_compact={"current": {"ctl": 30, "atl": 45, "tsb": -15}},
+        fitness_historical=None,
+        expanded_workouts=[
+            {"title": "Run largo", "detail": {"workout_comments": "Calor fuerte, fatiga y gel insuficiente"}},
+            {"title": "Run easy", "detail": {"workout_comments": "Fatiga residual, sin dolor"}},
+        ],
+        period_days=14,
+        cycle_status={"test_cp_ftp_scheduled": "Jul 20-26, 2026"},
+        pain_mentions=0,
+        pw_hr_status={"available_in_period_review_context": False},
+        consistency_warnings=["example_conflict"],
+    )
+
+    assert result["heat_environment"]["mentions"] == 1
+    assert result["heat_environment"]["fueling_or_hydration_mentions"] == 1
+    assert "repeated_fatigue_language" in result["reds_energy_availability"]["flags"]
+    assert "sleep_low_energy_availability_context_needed" in result["reds_energy_availability"]["flags"]
+    assert result["cp_quality"]["next_test_window"] == "Jul 20-26, 2026"
+    assert result["load_distribution"]["rpe7_count"] == 2
+    assert result["uncertainty"]["confidence"] == "low_until_reconciled"
+    assert "avoid ACWR-style causal injury claims" in result["load_distribution"]["rule"]
+    assert "not diagnoses" in result["pain_safety"]["rule"]
+
+
 @pytest.mark.asyncio
 async def test_daily_brief_context_expands_missed_yesterday_detail_and_classifies_reason(monkeypatch):
     calls: list[tuple[str, str | None]] = []
