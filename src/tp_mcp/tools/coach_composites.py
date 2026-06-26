@@ -245,6 +245,47 @@ def _is_planned_workout(workout: dict[str, Any]) -> bool:
     )
 
 
+def _daily_brief_tss_contract(week_context: Any) -> dict[str, Any]:
+    """Pre-compute TSS wording so Daily Briefs don't mislabel mixed totals.
+
+    The daily brief often needs three distinct numbers: completed actual TSS,
+    original planned TSS, and projected week TSS if the remaining planned
+    sessions are completed. Returning them explicitly prevents the LLM from
+    calling an actual+future projection "planificado total".
+    """
+    summary = week_context.get("weekly_summary", {}) if isinstance(week_context, dict) else {}
+    workouts = summary.get("workouts", []) if isinstance(summary, dict) else []
+    workouts = [item for item in workouts if isinstance(item, dict)]
+    completed_actual = 0.0
+    planned_original = 0.0
+    projected_if_remaining_completed = 0.0
+    for workout in workouts:
+        planned_tss = _field_float(workout, "tss_planned", "planned_tss", "plannedTss")
+        actual_tss = _field_float(workout, "tss_actual", "actual_tss", "tssActual")
+        fallback_tss = _field_float(workout, "tss")
+        if planned_tss is not None:
+            planned_original += planned_tss
+        elif fallback_tss is not None:
+            planned_original += fallback_tss
+        if _is_workout_completed(workout):
+            value = actual_tss if actual_tss is not None else fallback_tss
+            completed_actual += value or 0.0
+            projected_if_remaining_completed += value or 0.0
+        else:
+            value = planned_tss if planned_tss is not None else fallback_tss
+            projected_if_remaining_completed += value or 0.0
+    return {
+        "completed_actual_tss": round(completed_actual, 1),
+        "planned_original_tss": round(planned_original, 1),
+        "projected_tss_if_remaining_completed": round(projected_if_remaining_completed, 1),
+        "wording_rule": (
+            "Use 'completado' for completed_actual_tss, 'planificado original' for planned_original_tss, "
+            "and 'proyectado si se completa lo restante' for projected_tss_if_remaining_completed. "
+            "Never call a mixed actual+future projection 'planificado total'."
+        ),
+    }
+
+
 async def tp_coach_week_context(week_of: str | None = None) -> dict[str, Any]:
     """Read-only composite weekly context for Fitnessbot reports."""
     try:
@@ -313,8 +354,10 @@ async def tp_coach_week_context(week_of: str | None = None) -> dict[str, Any]:
                 "execute easy, no extra."
             ),
             "two_light_rule": (
-                "When useful, separate physiological readiness light from session/microcycle decision light: "
-                "e.g. readiness fisiológica verde, decisión de sesión amarilla por carga/impacto."
+                "Separate physiological readiness from the session/microcycle decision in the headline when useful. "
+                "For rest/recovery/no-workout days, prefer 'Readiness fisiológica: verde / Decisión: "
+                "descanso planificado' "
+                "instead of an ambiguous standalone '🟢 Hoy'."
             ),
             "good_readiness_does_not_add_load_rule": (
                 "Good readiness authorizes executing recovery; it does not authorize extending, chasing pace, "
@@ -489,13 +532,39 @@ async def tp_coach_daily_brief_context(date_str: str | None = None) -> dict[str,
     readiness_result = data.get("readiness")
     readiness_freshness = readiness_result.get("metric_freshness", {}) if isinstance(readiness_result, dict) else {}
     readiness_is_current = readiness_freshness.get("is_current_day") is True
+    week_context = data.get("week_context")
     return {
         "date": ref_s,
         "week": {"start": start.isoformat(), "end": end.isoformat()},
+        "daily_brief_output_contract": {
+            "headline_rule": (
+                "Separate Readiness fisiológica from Decisión del día/sesión; never use ambiguous "
+                "'🟢 Hoy' alone."
+            ),
+            "rest_day_rule": (
+                "If today has no planned workout, say descanso planificado/sin sesión and do not imply "
+                "green means add training."
+            ),
+            "closure_required_when_space_allows": [
+                "Confianza",
+                "Qué voy a vigilar",
+                "Dato faltante",
+                "Qué cambiaría la decisión",
+            ],
+            "recovery_wording_rule": (
+                "Avoid absolutes like 'plenamente recuperado'; say physiological signals show strong recovery "
+                "and still respect the microcycle."
+            ),
+            "body_battery_format_rule": (
+                "If Body Battery is [min,max,avg], prefer: max al despertar, mínimo, promedio; "
+                "recovery support, not permission to add load."
+            ),
+        },
+        "tss_language_contract": _daily_brief_tss_contract(week_context),
         "today": today_workouts,
         "yesterday": expanded_yesterday,
         "readiness": data.get("readiness"),
-        "week_context": data.get("week_context"),
+        "week_context": week_context,
         "calendar_notes": calendar_notes_result,
         "decision_guardrails": {
             "can_interpret_missed_yesterday": can_interpret,

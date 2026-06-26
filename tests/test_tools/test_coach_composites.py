@@ -407,7 +407,16 @@ async def test_daily_brief_context_expands_missed_yesterday_detail_and_classifie
         return {"classification": {"traffic_light": "yellow"}}
 
     async def fake_week_context(week_of=None):
-        return {"week": {"start": "2026-06-01", "end": "2026-06-07"}, "workouts": {}}
+        return {
+            "week": {"start": "2026-06-01", "end": "2026-06-07"},
+            "weekly_summary": {
+                "workouts": [
+                    {"date": "2026-06-01", "type": "completed", "tss_planned": 40, "tss_actual": 42},
+                    {"date": "2026-06-02", "type": "planned", "tss_planned": 30, "tss_actual": None},
+                ]
+            },
+            "workouts": {},
+        }
 
     async def fake_workouts(start_date, end_date, workout_filter="all"):
         calls.append(("workouts", f"{start_date}:{end_date}:{workout_filter}"))
@@ -464,6 +473,19 @@ async def test_daily_brief_context_expands_missed_yesterday_detail_and_classifie
     assert "No tuve tiempo" in yesterday["reason"]["evidence"]
     assert result["decision_guardrails"]["can_interpret_missed_yesterday"] is True
     assert "tp_get_workout_detail_and_private_note_called_for_missed_yesterday" in result["verification"]
+    contract = result["daily_brief_output_contract"]
+    assert "Readiness fisiológica" in contract["headline_rule"]
+    assert contract["closure_required_when_space_allows"] == [
+        "Confianza",
+        "Qué voy a vigilar",
+        "Dato faltante",
+        "Qué cambiaría la decisión",
+    ]
+    tss = result["tss_language_contract"]
+    assert tss["completed_actual_tss"] == 42.0
+    assert tss["planned_original_tss"] == 70.0
+    assert tss["projected_tss_if_remaining_completed"] == 72.0
+    assert "Never call" in tss["wording_rule"]
 
 
 def test_period_expansion_does_not_classify_future_planned_workout_as_missed():
@@ -610,7 +632,8 @@ async def test_week_context_advertises_daily_brief_protocol(monkeypatch):
     assert "rango TP 63→100" in freshness_contract["body_battery_rule"]
     assert "not an alarm" in freshness_contract["load_language_rule"]
     assert "legs/impact" in freshness_contract["combined_readiness_load_rule"]
-    assert "readiness fisiológica verde" in freshness_contract["two_light_rule"]
+    assert "Readiness fisiológica: verde" in freshness_contract["two_light_rule"]
+    assert "🟢 Hoy" in freshness_contract["two_light_rule"]
     assert "executing recovery" in freshness_contract["good_readiness_does_not_add_load_rule"]
     assert "10-15 W" in freshness_contract["recovery_execution_fallback_rule"]
     assert "3-5 evidence bullets" in freshness_contract["brevity_rule"]
